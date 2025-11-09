@@ -1,0 +1,63 @@
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: kbench-pvc
+spec:
+  volumeMode: Filesystem
+  storageClassName: longhorn-v2-r1
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 13Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kbench
+spec:
+  template:
+    metadata:
+      labels:
+        kbench: fio
+    spec:
+      nodeName: inst-1ru91-dereksu-nvme
+      containers:
+        - name: kbench
+          image: derekbit/kbench:latest
+          imagePullPolicy: Always
+          env:
+            #        - name: MODE
+            #          value: "quick" # for debugging
+            #        - name: MODE
+            #          value: "random-read-iops"
+            #        - name: MODE
+            #          value: "sequential-read-bandwidth"
+            #        - name: MODE
+            #          value: "random-read-latency"
+            #        - name: MODE
+            #          value: "random-write-iops"
+            #        - name: MODE
+            #          value: "sequential-write-bandwidth"
+            #        - name: MODE
+            #          value: "random-write-latency"
+            - name: MODE
+              value: "full" # run all tests
+            - name: FILE_NAME
+              value: "/volume/test"
+            - name: SIZE
+              value: "10G" # must be 10% smaller than the PVC size due to filesystem also took space
+            - name: CPU_IDLE_PROF
+              value: "disabled" # must be "enabled" or "disabled"
+          volumeMounts:
+            - name: vol
+              mountPath: /volume/
+              #volumeDevices:
+              #- name: vol
+              #  devicePath: /volume/test
+      restartPolicy: Never
+      volumes:
+        - name: vol
+          persistentVolumeClaim:
+            claimName: kbench-pvc
+  backoffLimit: 0
