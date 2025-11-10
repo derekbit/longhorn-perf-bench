@@ -3,8 +3,8 @@
 LOCAL_PATH_PROVISIONER_VERSION="0.0.32"
 LOCAL_PATH_PROVISIONER_DISK_PATH="/mnt/local-path-provisioner"
 
-NODES=("inst-1ru91-dereksu-nvme" "inst-bcoj9-dereksu-nvme" "inst-hljkq-dereksu-nvme")
-BLOCK_TYPE_DISKS=("0000:00:04.0" "0000:00:04.0" "0000:00:05.0")
+NODES=("m3-large-x86-01" "m3-large-x86-02" "m3-large-x86-03")
+BLOCK_TYPE_DISKS=("0000:45:00.0" "0000:44:00.0" "0000:45:00.0")
 CPU_MASKS=("0x1" "0x3" "0xF" "0x3F" "0xFF")
 
 function install_local_path_provisioner() {
@@ -586,34 +586,69 @@ function benchmark_v2_r1_crossnode_volume() {
     run_fio "longhorn-v2-r1" "${NODES[0]}" || exit 1
 }
 
+function run() {
+    DATA_ENGINE="$1"
+
+    echo "⚙️ Installing local-path provisioner..."
+    install_local_path_provisioner || exit 1
+
+    echo "⚙️ Resetting Longhorn storage classes..."
+    kubectl delete -f storageclass/
+    kubectl apply -f storageclass/
+
+    case "$DATA_ENGINE" in
+      v1)
+        echo "🏃🏃🏃 Benchmarking v1 1-replicas volume..."
+        benchmark_v1_r1_volume || exit 1
+
+        echo "🏃🏃🏃 Benchmarking v1 1-replicas cross-node volume..."
+        benchmark_v1_r1_crossnode_volume || exit 1
+
+        echo "🏃🏃🏃 Benchmarking v1 3-replicas volume..."
+        benchmark_v1_r3_volume || exit 1
+        ;;
+      v2)
+        for CPU_MASK in "${CPU_MASKS[@]}"; do
+            echo "🏃🏃🏃 Benchmarking v2 1-replica volume with CPU mask ${CPU_MASK}..."
+            benchmark_v2_r1_volume "${CPU_MASK}" || exit 1
+        done
+
+        for CPU_MASK in "${CPU_MASKS[@]}"; do
+            echo "🏃🏃🏃 Benchmarking v2 1-replica cross-node volume with CPU mask ${CPU_MASK}..."
+            benchmark_v2_r1_crossnode_volume "${CPU_MASK}" || exit 1
+        done
+
+        for CPU_MASK in "${CPU_MASKS[@]}"; do
+            echo "🏃🏃🏃 Benchmarking v2 3-replicas volume with CPU mask ${CPU_MASK}..."
+            benchmark_v2_r3_volume "${CPU_MASK}" || exit 1
+        done
+        ;;
+      *)
+        echo "❌ Error: Invalid data engine specified. Use 'v1', 'v2', or 'both'."
+        exit 1
+        ;;
+    esac
+}
+
+function reset() {
+    echo "🔄 Resetting environment to default state..."
+    reset_environment || exit 1
+}
+
 # ============ Main Logic ============
-echo "⚙️ Resetting Longhorn storage classes..."
-kubectl delete -f storageclass/
-kubectl apply -f storageclass/
 
-echo "⚙️ Installing local-path provisioner..."
-install_local_path_provisioner || exit 1
+case "$1" in
+  reset)
+    reset_environment
+    ;;
+  run)
+    DATA_ENGINE="$2"
+    run "$DATA_ENGINE"
+    ;;
+  *)
+    echo "Usage: $0 {reset|run <v1|v2>}"
+    exit 1
+    ;;
+esac
 
-echo "🏃🏃🏃 Benchmarking v1 3-replicas volume..."
-benchmark_v1_r3_volume || exit 1
 
-echo "🏃🏃🏃 Benchmarking v1 1-replicas volume..."
-benchmark_v1_r1_volume || exit 1
-
-echo "🏃🏃🏃 Benchmarking v1 1-replicas cross-node volume..."
-benchmark_v1_r1_crossnode_volume || exit 1
-
-for CPU_MASK in "${CPU_MASKS[@]}"; do
-    echo "🏃🏃🏃 Benchmarking v2 3-replicas volume with CPU mask ${CPU_MASK}..."
-    benchmark_v2_r3_volume "${CPU_MASK}" || exit 1
-done
-
-for CPU_MASK in "${CPU_MASKS[@]}"; do
-    echo "🏃🏃🏃 Benchmarking v2 1-replica volume with CPU mask ${CPU_MASK}..."
-    benchmark_v2_r1_volume "${CPU_MASK}" || exit 1
-done
-
-for CPU_MASK in "${CPU_MASKS[@]}"; do
-    echo "🏃🏃🏃 Benchmarking v2 1-replica cross-node volume with CPU mask ${CPU_MASK}..."
-    benchmark_v2_r1_crossnode_volume "${CPU_MASK}" || exit 1
-done
