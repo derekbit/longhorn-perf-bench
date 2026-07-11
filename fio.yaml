@@ -4,9 +4,9 @@ metadata:
   name: kbench-pvc
 spec:
   volumeMode: Filesystem
-  storageClassName: longhorn-v2-r1
+  storageClassName: longhorn-v2-r3
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   resources:
     requests:
       storage: 13Gi
@@ -21,7 +21,8 @@ spec:
       labels:
         kbench: fio
     spec:
-      nodeName: inst-1ru91-dereksu-nvme
+      nodeSelector:
+        kubernetes.io/hostname: dereksu-bench-3
       containers:
         - name: kbench
           image: derekbit/kbench:latest

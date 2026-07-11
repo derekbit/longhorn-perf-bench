@@ -1,0 +1,4 @@
+# Optional. generate_report.py works without any dependencies (pure
+# standard library), but renders nicer charts if matplotlib is installed:
+#   pip install -r requirements.txt
+matplotlib
