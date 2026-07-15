@@ -6,7 +6,7 @@ spec:
   volumeMode: Filesystem
   storageClassName: longhorn-v2-r3
   accessModes:
-    - ReadWriteMany
+    - ReadWriteOnce
   resources:
     requests:
       storage: 13Gi

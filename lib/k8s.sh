@@ -151,6 +151,80 @@ function disk_is_ready_and_schedulable() {
 # Filesystem disks
 # ---------------------------------------------------------------------------
 
+# add_filesystem_disks <disks_array_name> - iterates NODES[] and ensures the
+# corresponding filesystem disk from the named array (bash nameref) exists on
+# each node. Idempotent: existing disks with the same path are left alone.
+function add_filesystem_disks() {
+    local disks_array_name="$1"
+    if [[ -z "$disks_array_name" ]]; then
+        log_error "add_filesystem_disks requires a disks-array name (e.g. FILESYSTEM_DISKS)."
+        return 1
+    fi
+    local -n disks_ref="$disks_array_name"
+
+    for i in "${!NODES[@]}"; do
+        local NODE="${NODES[i]}"
+        local DISK="${disks_ref[i]}"
+
+        if [[ -z "$DISK" ]]; then
+            log_warn "No filesystem disk defined for node ${NODE} in ${disks_array_name}, skipping..."
+            continue
+        fi
+
+        add_filesystem_disk_on_node "$NODE" "$DISK" || die "Failed to add filesystem disk ${DISK} on node ${NODE}."
+    done
+}
+
+function add_filesystem_disk_on_node() {
+    local NODE="$1" DISK_PATH="$2" DISK_NAME="disk-fs"
+
+    if [[ -z "$NODE" || -z "$DISK_PATH" ]]; then
+        log_error "Usage: add_filesystem_disk_on_node <node> <disk_path>"
+        return 1
+    fi
+
+    # Skip patching if a filesystem disk with this exact path already exists
+    # (under any name) - avoids clashing with any pre-existing default disk.
+    # We still wait for it to be Ready and Schedulable below.
+    local EXISTING_KEY
+    EXISTING_KEY=$(kubectl -n longhorn-system get node.longhorn.io "${NODE}" -o json \
+        | jq -r --arg path "$DISK_PATH" \
+            '.spec.disks | to_entries | map(select(.value.path == $path)) | .[0].key // ""')
+    if [[ -n "$EXISTING_KEY" ]]; then
+        log_ok "Filesystem disk with path '${DISK_PATH}' already exists on node '${NODE}' as '${EXISTING_KEY}'."
+        DISK_NAME="$EXISTING_KEY"
+    else
+        log_step "Adding filesystem disk '${DISK_NAME}' (${DISK_PATH}) to Longhorn node '${NODE}'..."
+
+        local DISK_CONFIG
+        DISK_CONFIG=$(cat <<EOF
+{
+  "path": "${DISK_PATH}",
+  "allowScheduling": true,
+  "evictionRequested": false,
+  "diskType": "filesystem",
+  "diskDriver": "",
+  "storageReserved": 0
+}
+EOF
+)
+
+        retry_cmd "$RETRY_COUNT" "$RETRY_INTERVAL" "Patch node '${NODE}' to add disk '${DISK_NAME}'" \
+            kubectl -n longhorn-system patch node.longhorn.io "${NODE}" \
+                --type='json' -p="[{\"op\":\"add\",\"path\":\"/spec/disks/${DISK_NAME}\",\"value\":${DISK_CONFIG}}]" \
+            || return 1
+    fi
+
+    log_wait "Waiting for filesystem disk '${DISK_NAME}' on node '${NODE}' to be Ready and Schedulable..."
+    if poll_until "$RETRY_COUNT" "$RETRY_INTERVAL" "disk '${DISK_NAME}' ready and schedulable" \
+        disk_is_ready_and_schedulable "$NODE" "$DISK_NAME"; then
+        log_ok "Filesystem disk '${DISK_NAME}' is Ready and Schedulable on node '${NODE}'."
+        return 0
+    fi
+
+    return 1
+}
+
 function enable_filesystem_disks() {
     for NODE in "${NODES[@]}"; do
         enable_filesystem_disks_on_node "$NODE" || return 1
@@ -229,12 +303,21 @@ function disable_filesystem_disks_on_node() {
 # ---------------------------------------------------------------------------
 
 function add_block_disks() {
+    # add_block_disks <disks_array_name> - iterates NODES[] and adds the
+    # corresponding disk from the named array (bash nameref) to each node.
+    local disks_array_name="$1"
+    if [[ -z "$disks_array_name" ]]; then
+        log_error "add_block_disks requires a disks-array name (e.g. NVME_BDEV_DISKS)."
+        return 1
+    fi
+    local -n disks_ref="$disks_array_name"
+
     for i in "${!NODES[@]}"; do
         local NODE="${NODES[i]}"
-        local DISK="${BLOCK_TYPE_DISKS[i]}"
+        local DISK="${disks_ref[i]}"
 
         if [[ -z "$DISK" ]]; then
-            log_warn "No block disk defined for node ${NODE}, skipping..."
+            log_warn "No block disk defined for node ${NODE} in ${disks_array_name}, skipping..."
             continue
         fi
 

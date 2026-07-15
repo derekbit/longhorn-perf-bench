@@ -31,26 +31,43 @@ source "${SCRIPT_DIR}/lib/benchmarks.sh"
 # ---------------------------------------------------------------------------
 
 NODES=("dereksu-bench-1" "dereksu-bench-2" "dereksu-bench-3")
-#BLOCK_TYPE_DISKS=("0000:00:0b.0" "0000:00:0b.0" "0000:00:0b.0")
-BLOCK_TYPE_DISKS=("/dev/nvme3n1" "/dev/nvme3n1" "/dev/nvme3n1")
+# Per-node filesystem-disk paths for the v1 data engine. Each entry is
+# ensured to exist as a Longhorn filesystem disk on the corresponding node
+# before v1 benchmarks run (idempotent - existing disks with the same path
+# are skipped). Set to () to skip auto-provisioning (expect the disks to be
+# pre-configured on the cluster).
+FILESYSTEM_DISKS=("/mnt/disk" "/mnt/disk" "/mnt/disk")
+# Per-node block-disk paths for each v2 bdev backend. The suite runs BDF disks
+# first (as NVMe bdev), then block-device paths (as AIO bdev). Set either
+# array to () to skip that bdev type.
+NVME_BDEV_DISKS=("0000:00:0b.0" "0000:00:0b.0" "0000:00:0b.0")   # BDF format
+AIO_BDEV_DISKS=("/dev/nvme3n1" "/dev/nvme3n1" "/dev/nvme3n1")     # block device path
 CPU_MASKS=("0x1" "0x3" "0xF" "0xFF" "0xFFFF")
 
 # PVC access mode used by the fio benchmark. "ReadWriteOnce" works for every
 # StorageClass here; "ReadWriteMany" requires a Longhorn StorageClass backed
 # by a share-manager (v1) - v2 and local-path don't support RWX.
-FIO_ACCESS_MODE="ReadWriteMany"
+FIO_ACCESS_MODE="ReadWriteOnce"
 
-# Which NODES[] entry actually runs the fio benchmark pod (the "volume"
+# Which NODES[] entry actually runs the fio benchmark pod (the workload
 # node). Change this to e.g. 2 to run fio on the third node instead of the
 # first - no other edits needed, fio.yaml is patched automatically from this
-# on every run. For "cross-node replica" scenarios, the replica's disk is
-# automatically placed on the *next* node in NODES (wrapping around), e.g.
-# volume on node 0 -> replica on node 1; volume on node 2 -> replica on node 0.
+# on every run.
+#
+# For "cross-node replica" scenarios, the replica's disk is placed on the
+# node immediately after the *volume attach node* (wrapping around):
+#   - RWO:  volume attach node == FIO_NODE, so replica lands on
+#           (FIO_NODE_INDEX + 1) % ${#NODES[@]}.
+#   - RWX:  volume attach node == SHARE_MANAGER_POD_NODE, so replica lands
+#           on (SHARE_MANAGER_POD_NODE_INDEX + 1) % ${#NODES[@]}. This is
+#           needed because the Longhorn engine attaches to the share-manager
+#           pod's node under RWX - not the fio pod's node.
 FIO_NODE_INDEX=2
 
 # Which NODES[] entry runs each Longhorn StorageClass's share-manager
-# (parameters.shareManagerNodeSelector). Defaults to the first node,
-# independent of FIO_NODE_INDEX.
+# (parameters.shareManagerNodeSelector). Only relevant when FIO_ACCESS_MODE
+# is "ReadWriteMany". Defaults to the first node, independent of
+# FIO_NODE_INDEX.
 SHARE_MANAGER_POD_NODE_INDEX=0
 
 # Whether to also install local-path-provisioner and benchmark it as a
@@ -65,12 +82,25 @@ if [[ "${#NODES[@]}" -lt 2 ]]; then
     exit 1
 fi
 
-CROSSNODE_DISK_INDEX=$(( (FIO_NODE_INDEX + 1) % ${#NODES[@]} ))
+# The "volume attach node" is where the Longhorn engine actually attaches:
+#   - RWO: the fio pod's node (engine attaches wherever the workload runs).
+#   - RWX (v1 share-manager): the share-manager pod's node (the engine
+#     attaches to the share-manager, which then serves NFS to the fio pod).
+# Cross-node replica placement and single-replica placement are derived from
+# this - otherwise, when SHARE_MANAGER_POD_NODE_INDEX happens to equal
+# (FIO_NODE_INDEX + 1) % ${#NODES[@]}, the "cross-node" replica ends up on
+# the same node as the engine.
+if [[ "$FIO_ACCESS_MODE" == "ReadWriteMany" ]]; then
+    VOLUME_ATTACH_NODE_INDEX="$SHARE_MANAGER_POD_NODE_INDEX"
+else
+    VOLUME_ATTACH_NODE_INDEX="$FIO_NODE_INDEX"
+fi
+
+CROSSNODE_DISK_INDEX=$(( (VOLUME_ATTACH_NODE_INDEX + 1) % ${#NODES[@]} ))
 
 FIO_NODE="${NODES[$FIO_NODE_INDEX]}"
-FIO_BLOCK_DISK="${BLOCK_TYPE_DISKS[$FIO_NODE_INDEX]}"
+VOLUME_ATTACH_NODE="${NODES[$VOLUME_ATTACH_NODE_INDEX]}"
 CROSSNODE_NODE="${NODES[$CROSSNODE_DISK_INDEX]}"
-CROSSNODE_BLOCK_DISK="${BLOCK_TYPE_DISKS[$CROSSNODE_DISK_INDEX]}"
 
 SHARE_MANAGER_POD_NODE="${NODES[$SHARE_MANAGER_POD_NODE_INDEX]}"
 
@@ -95,6 +125,7 @@ FIO_JOB_NAME="kbench"
 
 RESULTS_DIR="${SCRIPT_DIR}/results"
 RESULTS_CSV="${RESULTS_DIR}/results.csv"
+RESULTS_MD="${RESULTS_DIR}/results.md"
 RESULTS_LOG_DIR="${RESULTS_DIR}/logs"
 REPORT_HTML="${RESULTS_DIR}/report.html"
 
@@ -105,19 +136,30 @@ MODE_1_REPLICA_CROSSNODE="1 cross-node replica"
 MODE_3_REPLICAS="3 replicas"
 
 # ============ Main Logic ============
+#
+# Wrapped in a function (and invoked at the very bottom) so that bash parses
+# the entire script before executing anything. Otherwise, editing run.sh
+# during a long benchmark run can shift byte offsets and make bash read a
+# partial line from disk, producing bogus "syntax error near unexpected
+# token" failures at completion time.
 
-case "$1" in
-    reset)
-        reset
-        ;;
-    run)
-        run "$2"
-        ;;
-    report)
-        generate_report
-        ;;
-    *)
-        echo "Usage: $0 {reset|run <v1|v2|all>|report}"
-        exit 1
-        ;;
-esac
+main() {
+    case "$1" in
+        reset)
+            reset
+            ;;
+        run)
+            run "$2"
+            ;;
+        report)
+            generate_report
+            ;;
+        *)
+            echo "Usage: $0 {reset|run <v1|v2|all>|report}"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
+exit $?

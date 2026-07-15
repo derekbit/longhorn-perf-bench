@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate an HTML performance report (tables + bar charts) from the
-results.csv produced by run.sh.
+"""Generate an HTML performance report and a matching markdown table
+(results.md) from the results.csv produced by run.sh.
 
 Charts are rendered with matplotlib (as inline SVG) when it is available,
 for nicer-looking output. If matplotlib isn't installed, this script falls
@@ -16,6 +16,7 @@ import csv
 import html
 import io
 import os
+import re
 from collections import OrderedDict
 from datetime import datetime
 
@@ -34,31 +35,65 @@ except ImportError:
 # CSV that isn't in this list is appended afterwards, in first-seen order.
 CANONICAL_MODES = ["1 replica", "1 cross-node replica", "3 replicas"]
 
-# Stable color palette, cycled if there are more series (labels) than colors.
-PALETTE = [
-    "#e74c3c", "#3498db", "#2ecc71", "#9b59b6", "#f1c40f",
-    "#1abc9c", "#e67e22", "#34495e", "#7f8c8d", "#16a085",
-    "#8e44ad", "#2980b9", "#27ae60", "#d35400", "#c0392b",
+# Chart definitions (one grouped bar chart per entry).
+# Fields:
+#   key         - stable identifier
+#   csv_field   - raw column in results.csv
+#   title       - chart title shown to the user
+#   scale       - multiplier applied to the raw value for display
+#   unit        - unit string shown in the title/axis
+CHARTS = [
+    dict(key="read_iops",  csv_field="rand_read_iops",   title="Read IOPS",        scale=1 / 1000.0,     unit="k"),
+    dict(key="write_iops", csv_field="rand_write_iops",  title="Write IOPS",       scale=1 / 1000.0,     unit="k"),
+    dict(key="read_bw",    csv_field="seq_read_kibps",   title="Read Throughput",  scale=1 / 1024.0,     unit="MiB/s"),
+    dict(key="write_bw",   csv_field="seq_write_kibps",  title="Write Throughput", scale=1 / 1024.0,     unit="MiB/s"),
+    dict(key="read_lat",   csv_field="rand_read_lat_ns", title="Read Latency",     scale=1 / 1000.0,     unit="microseconds"),
+    dict(key="write_lat",  csv_field="rand_write_lat_ns",title="Write Latency",    scale=1 / 1000.0,     unit="microseconds"),
 ]
 
-# (csv_field, display_name, transform, unit)
-METRICS = [
-    ("rand_read_iops", "Random Read IOPS", lambda v: v, "IOPS"),
-    ("rand_write_iops", "Random Write IOPS", lambda v: v, "IOPS"),
-    ("seq_read_kibps", "Sequential Read Throughput", lambda v: v / 1024.0, "MiB/s"),
-    ("seq_write_kibps", "Sequential Write Throughput", lambda v: v / 1024.0, "MiB/s"),
-    ("rand_read_lat_ns", "Random Read Latency", lambda v: v / 1000.0, "\u00b5s"),
-    ("rand_write_lat_ns", "Random Write Latency", lambda v: v / 1000.0, "\u00b5s"),
+# Markdown table groups: each has 2 metrics (Read + Write) sharing one caption.
+# Fields "read"/"write" reference CHARTS entries by key.
+TABLE_GROUPS = [
+    dict(caption="IOPS",               read_header="Random Read",  write_header="Random Write",  read="read_iops",  write="write_iops",  scale=1.0,        unit=""),
+    dict(caption="Throughput (MiB/s)", read_header="Sequential Read", write_header="Sequential Write", read="read_bw",  write="write_bw", scale=1 / 1024.0, unit=""),
+    dict(caption="Latency (\u00b5s)",  read_header="Random Read",  write_header="Random Write",  read="read_lat",   write="write_lat",   scale=1 / 1000.0, unit=""),
 ]
+
+# Note the two "scale" values above serve different purposes:
+# - CHARTS[*].scale is applied when plotting (e.g. IOPS -> k, latency ns -> us).
+# - TABLE_GROUPS[*].scale is applied when rendering the tables (e.g. throughput
+#   KiB/s -> MiB/s, latency ns -> us). IOPS tables show raw IOPS to match the
+#   example screenshot.
+
+# Palette for special series.
+COLOR_BASELINE = "#f39c12"   # orange
+COLOR_V1       = "#e74c3c"   # red
+
+# Ordered shades from light to dark, used to color v2 series by CPU-core count
+# within each bdev-type group. Matches the visual style of the example report.
+GREEN_SHADES = ["#c8e6c9", "#81c784", "#4caf50", "#2e7d32", "#1b5e20"]
+BLUE_SHADES  = ["#bbdefb", "#64b5f6", "#2196f3", "#1565c0", "#0d47a1"]
+
+# Fallback cycled palette for anything unrecognized.
+FALLBACK_PALETTE = [
+    "#9b59b6", "#1abc9c", "#e67e22", "#34495e", "#7f8c8d",
+    "#16a085", "#8e44ad", "#2980b9", "#27ae60", "#d35400",
+]
+
+V2_LABEL_RE = re.compile(
+    r"^v2 volume \(.*?(NVMe|AIO) bdev.*?(\d+)\s+CPU core", re.IGNORECASE
+)
 
 
 def load_results(csv_path):
     labels = []
     modes = []
-    data = OrderedDict()
+    raw = OrderedDict()  # label -> mode -> {csv_field: float}
 
     if not os.path.exists(csv_path):
-        return labels, modes, data
+        return labels, modes, raw
+
+    csv_fields = {chart["csv_field"] for chart in CHARTS}
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
@@ -68,66 +103,111 @@ def load_results(csv_path):
             if not label or not mode:
                 continue
 
-            if label not in data:
-                data[label] = {}
+            if label not in raw:
+                raw[label] = {}
                 labels.append(label)
             if mode not in modes:
                 modes.append(mode)
 
             metrics = {}
-            for field, _, transform, _ in METRICS:
-                raw = row.get(field, "")
+            for field in csv_fields:
+                value = row.get(field, "")
                 try:
-                    metrics[field] = transform(float(raw))
+                    metrics[field] = float(value)
                 except (TypeError, ValueError):
                     metrics[field] = None
-            data[label][mode] = metrics
+            raw[label][mode] = metrics
 
     ordered_modes = [m for m in CANONICAL_MODES if m in modes]
     ordered_modes += [m for m in modes if m not in ordered_modes]
 
-    return labels, ordered_modes, data
+    return labels, ordered_modes, raw
 
+
+def raw_value(raw, label, mode, csv_field):
+    return raw.get(label, {}).get(mode, {}).get(csv_field)
+
+
+def scaled_value(raw, label, mode, csv_field, scale):
+    v = raw_value(raw, label, mode, csv_field)
+    return v * scale if v is not None else None
+
+
+def parse_v2(label):
+    """Return (bdev_type, cores) if label is a recognizable v2 label, else None."""
+    m = V2_LABEL_RE.match(label)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def pick_shade(shades, cores, all_cores):
+    """Pick a shade from `shades` (light->dark) based on the position of
+    `cores` within the sorted set of `all_cores` seen for this bdev type.
+
+    - Smallest core count -> lightest shade, largest -> darkest.
+    - When only one series exists in the group, a medium shade is used so it
+      reads clearly on white and visually matches the other color families
+      (v1 red, baseline orange).
+    """
+    ordered = sorted(set(all_cores))
+    n = len(ordered)
+    if n == 0:
+        return shades[len(shades) // 2]
+    idx = ordered.index(cores)
+    if n == 1:
+        return shades[len(shades) // 2]
+    # Spread indices evenly across the palette.
+    slot = int(round(idx * (len(shades) - 1) / (n - 1)))
+    return shades[max(0, min(len(shades) - 1, slot))]
+
+
+def assign_colors(labels):
+    """Assign a color per label: v1 -> red, baseline -> orange, v2 NVMe -> greens
+    (light-to-dark by CPU cores), v2 AIO -> blues, others -> cycled palette."""
+    v2_by_bdev = {"NVMe": [], "AIO": []}
+    for label in labels:
+        parsed = parse_v2(label)
+        if parsed:
+            v2_by_bdev[parsed[0]].append(parsed[1])
+
+    colors = {}
+    fallback_idx = 0
+    for label in labels:
+        if "baseline" in label.lower():
+            colors[label] = COLOR_BASELINE
+            continue
+        if label.strip().lower().startswith("v1 volume"):
+            colors[label] = COLOR_V1
+            continue
+        parsed = parse_v2(label)
+        if parsed:
+            bdev, cores = parsed
+            shades = GREEN_SHADES if bdev == "NVMe" else BLUE_SHADES
+            colors[label] = pick_shade(shades, cores, v2_by_bdev[bdev])
+            continue
+        colors[label] = FALLBACK_PALETTE[fallback_idx % len(FALLBACK_PALETTE)]
+        fallback_idx += 1
+    return colors
+
+
+# ---------------------------------------------------------------------------
+# Number formatting
+# ---------------------------------------------------------------------------
 
 def fmt_number(value):
     if value is None:
         return "-"
+    if abs(value) < 10:
+        return f"{value:,.2f}"
     return f"{value:,.0f}"
 
 
-def build_table(title, unit, labels, modes, data, field_read, field_write):
-    header_cells = "".join(f'<th colspan="2">{html.escape(m)}</th>' for m in modes)
-    sub_header_cells = "".join("<th>Read</th><th>Write</th>" for _ in modes)
+# ---------------------------------------------------------------------------
+# Chart rendering (matplotlib preferred, stdlib fallback)
+# ---------------------------------------------------------------------------
 
-    rows = []
-    for label in labels:
-        cells = []
-        for mode in modes:
-            metrics = data.get(label, {}).get(mode, {})
-            cells.append(
-                f"<td>{fmt_number(metrics.get(field_read))}</td>"
-                f"<td>{fmt_number(metrics.get(field_write))}</td>"
-            )
-        rows.append(f'<tr><th class="row-label">{html.escape(label)}</th>{"".join(cells)}</tr>')
-
-    return f"""
-    <table class="results-table">
-      <caption>{html.escape(title)} ({html.escape(unit)})</caption>
-      <thead>
-        <tr><th></th>{header_cells}</tr>
-        <tr><th></th>{sub_header_cells}</tr>
-      </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
-    </table>
-    """
-
-
-def build_bar_chart_mpl(title, unit, labels, modes, data, field, colors):
-    """Render a grouped bar chart with matplotlib and return it as an inline
-    <svg>...</svg> fragment (no XML prolog/DOCTYPE) ready to embed in HTML.
-    """
+def build_bar_chart_mpl(title, unit, labels, modes, colors, values_by_label_mode):
     n_labels = max(len(labels), 1)
     n_modes = max(len(modes), 1)
 
@@ -139,8 +219,7 @@ def build_bar_chart_mpl(title, unit, labels, modes, data, field, colors):
     x = list(range(n_modes))
 
     for i, label in enumerate(labels):
-        values = [data.get(label, {}).get(mode, {}).get(field) for mode in modes]
-        values = [v if v is not None else 0 for v in values]
+        values = [values_by_label_mode.get((label, mode)) or 0 for mode in modes]
         offsets = [xi - group_width / 2 + i * bar_width + bar_width / 2 for xi in x]
         ax.bar(offsets, values, width=bar_width * 0.95, label=label, color=colors.get(label, "#999999"))
 
@@ -148,7 +227,7 @@ def build_bar_chart_mpl(title, unit, labels, modes, data, field, colors):
     ax.set_ylabel(unit)
     ax.set_xticks(x)
     ax.set_xticklabels(modes)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}" if abs(v) >= 10 else f"{v:.1f}"))
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -162,24 +241,16 @@ def build_bar_chart_mpl(title, unit, labels, modes, data, field, colors):
     return svg[svg.index("<svg"):]
 
 
-def build_bar_chart_svg(title, unit, labels, modes, data, field, colors):
-    """Pure standard-library fallback renderer, used when matplotlib isn't
-    installed. Returns an inline <svg>...</svg> fragment.
-    """
+def build_bar_chart_svg(title, unit, labels, modes, colors, values_by_label_mode):
     margin_left, margin_top, margin_bottom = 70, 40, 70
     plot_w = 600
     plot_h = 340
     max_label_len = max((len(label) for label in labels), default=10)
-    margin_right = min(420, max(160, max_label_len * 7 + 40))
+    margin_right = min(520, max(160, max_label_len * 7 + 40))
     width = margin_left + plot_w + margin_right
     height = margin_top + plot_h + margin_bottom
 
-    values = [
-        data.get(label, {}).get(mode, {}).get(field)
-        for label in labels
-        for mode in modes
-    ]
-    values = [v for v in values if v is not None]
+    values = [v for v in values_by_label_mode.values() if v is not None]
     max_val = max(values) if values else 1
     if max_val <= 0:
         max_val = 1
@@ -223,7 +294,7 @@ def build_bar_chart_svg(title, unit, labels, modes, data, field, colors):
     for gi, mode in enumerate(modes):
         gx = margin_left + gi * group_w
         for li, label in enumerate(labels):
-            v = data.get(label, {}).get(mode, {}).get(field)
+            v = values_by_label_mode.get((label, mode))
             if v is None:
                 continue
             color = colors.get(label, "#999999")
@@ -253,13 +324,90 @@ def build_bar_chart_svg(title, unit, labels, modes, data, field, colors):
     return "".join(parts)
 
 
-def build_bar_chart(title, unit, labels, modes, data, field, colors):
-    """Renders with matplotlib when available, otherwise falls back to the
-    dependency-free SVG renderer."""
+def build_bar_chart(title, unit, labels, modes, colors, values_by_label_mode):
     if HAS_MPL:
-        return build_bar_chart_mpl(title, unit, labels, modes, data, field, colors)
-    return build_bar_chart_svg(title, unit, labels, modes, data, field, colors)
+        return build_bar_chart_mpl(title, unit, labels, modes, colors, values_by_label_mode)
+    return build_bar_chart_svg(title, unit, labels, modes, colors, values_by_label_mode)
 
+
+# ---------------------------------------------------------------------------
+# Table rendering (both HTML for report.html and Markdown/HTML for results.md)
+# ---------------------------------------------------------------------------
+
+def build_html_table(group, labels, modes, raw):
+    caption = group["caption"]
+    scale = group["scale"]
+    read_field = next(c["csv_field"] for c in CHARTS if c["key"] == group["read"])
+    write_field = next(c["csv_field"] for c in CHARTS if c["key"] == group["write"])
+
+    header_top = (
+        f'<th colspan="{len(modes)}">{html.escape(group["read_header"])}</th>'
+        f'<th colspan="{len(modes)}">{html.escape(group["write_header"])}</th>'
+    )
+    header_sub = "".join(f"<th>{html.escape(m)}</th>" for m in modes) * 2
+
+    rows = []
+    for label in labels:
+        cells = []
+        for m in modes:
+            cells.append(f"<td>{fmt_number(scaled_value(raw, label, m, read_field, scale))}</td>")
+        for m in modes:
+            cells.append(f"<td>{fmt_number(scaled_value(raw, label, m, write_field, scale))}</td>")
+        rows.append(f'<tr><th class="row-label">{html.escape(label)}</th>{"".join(cells)}</tr>')
+
+    return f"""
+    <table class="results-table">
+      <caption>{html.escape(caption)}</caption>
+      <thead>
+        <tr><th></th>{header_top}</tr>
+        <tr><th></th>{header_sub}</tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    """
+
+
+def build_md_html_table(group, labels, modes, raw):
+    """Same structure as build_html_table but standalone HTML for embedding
+    inside markdown (GitHub renders raw HTML in .md files, and this is the
+    only way to get a two-level header)."""
+    scale = group["scale"]
+    read_field = next(c["csv_field"] for c in CHARTS if c["key"] == group["read"])
+    write_field = next(c["csv_field"] for c in CHARTS if c["key"] == group["write"])
+
+    header_top = (
+        f'<th colspan="{len(modes)}" align="center">{html.escape(group["read_header"])}</th>'
+        f'<th colspan="{len(modes)}" align="center">{html.escape(group["write_header"])}</th>'
+    )
+    header_sub = "".join(f'<th align="right">{html.escape(m)}</th>' for m in modes) * 2
+
+    body_rows = []
+    for label in labels:
+        cells = []
+        for m in modes:
+            cells.append(f'<td align="right">{fmt_number(scaled_value(raw, label, m, read_field, scale))}</td>')
+        for m in modes:
+            cells.append(f'<td align="right">{fmt_number(scaled_value(raw, label, m, write_field, scale))}</td>')
+        body_rows.append(f"<tr><td>{html.escape(label)}</td>{''.join(cells)}</tr>")
+
+    return (
+        "<table>\n"
+        "  <thead>\n"
+        f"    <tr><th></th>{header_top}</tr>\n"
+        f"    <tr><th></th>{header_sub}</tr>\n"
+        "  </thead>\n"
+        "  <tbody>\n"
+        + "".join(f"    {row}\n" for row in body_rows) +
+        "  </tbody>\n"
+        "</table>\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report templates
+# ---------------------------------------------------------------------------
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -298,59 +446,127 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+def build_markdown(csv_path, labels, modes, raw, md_out, svg_dir, svg_files):
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    parts = [
+        "# Longhorn Performance Benchmark Results\n",
+        f"_Generated at {generated_at} from `{csv_path}`._\n",
+    ]
+
+    # Compute a relative path from the markdown file to the svg directory so
+    # image links keep working regardless of where results/ lives.
+    md_dir = os.path.dirname(os.path.abspath(md_out)) if md_out else os.getcwd()
+
+    def rel(svg_path):
+        try:
+            return os.path.relpath(svg_path, md_dir)
+        except ValueError:
+            return svg_path
+
+    for group in TABLE_GROUPS:
+        parts.append(f"\n## {group['caption']}\n")
+        parts.append(build_md_html_table(group, labels, modes, raw))
+
+        chart_lines = []
+        for chart_key, header in ((group["read"], group["read_header"]),
+                                  (group["write"], group["write_header"])):
+            svg_path = svg_files.get(chart_key)
+            if svg_path:
+                chart_lines.append(
+                    f"![{header}]({rel(svg_path)})"
+                )
+        if chart_lines:
+            parts.append("\n" + "\n\n".join(chart_lines) + "\n")
+
+    return "".join(parts)
+
+
+def write_empty_outputs(html_out, md_out, csv_path):
+    with open(html_out, "w") as f:
+        f.write(
+            "<!DOCTYPE html><html><body>"
+            "<p>No benchmark results found yet. Run <code>./run.sh run &lt;v1|v2|all&gt;</code> first.</p>"
+            "</body></html>"
+        )
+    if md_out:
+        with open(md_out, "w") as f:
+            f.write(
+                "# Longhorn Performance Benchmark Results\n\n"
+                f"_No benchmark results found in `{csv_path}` yet. "
+                "Run `./run.sh run <v1|v2|all>` first._\n"
+            )
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate the longhorn-perf-bench HTML report.")
+    parser = argparse.ArgumentParser(description="Generate the longhorn-perf-bench report.")
     parser.add_argument("--csv", default="results/results.csv", help="Path to results.csv")
     parser.add_argument("--out", default="results/report.html", help="Path to write report.html")
+    parser.add_argument("--md",  default="results/results.md",  help="Path to write results.md")
+    parser.add_argument("--svg-dir", default="results/charts",
+                        help="Directory to write one standalone SVG per bar chart")
     args = parser.parse_args()
 
-    out_dir = os.path.dirname(os.path.abspath(args.out))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    for out in (args.out, args.md):
+        out_dir = os.path.dirname(os.path.abspath(out))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+    if args.svg_dir:
+        os.makedirs(os.path.abspath(args.svg_dir), exist_ok=True)
 
-    labels, modes, data = load_results(args.csv)
+    labels, modes, raw = load_results(args.csv)
 
     if not labels:
-        with open(args.out, "w") as f:
-            f.write(
-                "<!DOCTYPE html><html><body>"
-                "<p>No benchmark results found yet. Run <code>./run.sh run &lt;v1|v2|all&gt;</code> first.</p>"
-                "</body></html>"
-            )
-        print(f"⚠️  No results found in {args.csv}; wrote an empty report to {args.out}")
+        write_empty_outputs(args.out, args.md, args.csv)
+        print(f"\u26a0\ufe0f  No results found in {args.csv}; wrote empty {args.out} and {args.md}")
         return
 
     if not HAS_MPL:
-        print("ℹ️  matplotlib not found; using the built-in SVG renderer. "
+        print("\u2139\ufe0f  matplotlib not found; using the built-in SVG renderer. "
               "Run `pip install matplotlib` for nicer charts.")
 
-    colors = {label: PALETTE[i % len(PALETTE)] for i, label in enumerate(labels)}
+    colors = assign_colors(labels)
 
-    tables = "".join(
-        build_table(title, unit, labels, modes, data, field_read, field_write)
-        for title, unit, field_read, field_write in [
-            ("Random IOPS (Read / Write)", "IOPS", "rand_read_iops", "rand_write_iops"),
-            ("Sequential Throughput (Read / Write)", "MiB/s", "seq_read_kibps", "seq_write_kibps"),
-            ("Random Latency (Read / Write)", "\u00b5s", "rand_read_lat_ns", "rand_write_lat_ns"),
-        ]
-    )
+    # HTML report - tables + charts. Render each chart once and reuse the
+    # SVG payload for both the inline HTML report and the standalone .svg
+    # files (also referenced from the markdown report).
+    html_tables = "".join(build_html_table(g, labels, modes, raw) for g in TABLE_GROUPS)
+    chart_htmls = []
+    svg_files = {}
+    for chart in CHARTS:
+        values = {
+            (label, mode): scaled_value(raw, label, mode, chart["csv_field"], chart["scale"])
+            for label in labels
+            for mode in modes
+        }
+        svg = build_bar_chart(chart["title"], chart["unit"], labels, modes, colors, values)
+        chart_htmls.append(f'<div class="chart-card">{svg}</div>')
 
-    charts = "".join(
-        f'<div class="chart-card">{build_bar_chart(display, unit, labels, modes, data, field, colors)}</div>'
-        for field, display, _, unit in METRICS
-    )
+        if args.svg_dir:
+            svg_path = os.path.join(os.path.abspath(args.svg_dir), f"{chart['key']}.svg")
+            with open(svg_path, "w") as f:
+                if not svg.lstrip().startswith("<?xml"):
+                    f.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
+                f.write(svg)
+            svg_files[chart["key"]] = svg_path
 
     html_doc = PAGE_TEMPLATE.format(
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         csv_path=html.escape(args.csv),
-        tables=tables,
-        charts=charts,
+        tables=html_tables,
+        charts="".join(chart_htmls),
     )
-
     with open(args.out, "w") as f:
         f.write(html_doc)
+    print(f"\u2705 HTML report generated: {os.path.abspath(args.out)}")
 
-    print(f"✅ Report generated: {os.path.abspath(args.out)}")
+    if svg_files:
+        print(f"\u2705 Bar chart SVGs generated in: {os.path.abspath(args.svg_dir)} "
+              f"({len(svg_files)} files)")
+
+    if args.md:
+        with open(args.md, "w") as f:
+            f.write(build_markdown(args.csv, labels, modes, raw, args.md, args.svg_dir, svg_files))
+        print(f"\u2705 Markdown report generated: {os.path.abspath(args.md)}")
 
 
 if __name__ == "__main__":

@@ -19,16 +19,40 @@ Set `RUN_BASELINE=true` in run.sh to also install local-path-provisioner and
 benchmark it as a baseline on every `run` (default: `false`).
 
 Every `run` is fully automated end-to-end (cluster setup, fio execution,
-result parsing, and report generation) and finishes by regenerating
-`results/report.html` - a single self-contained HTML file (tables + bar
-charts, no external dependencies) that can be opened directly in a browser.
-Raw numbers are kept in `results/results.csv`, and per-test fio logs are
-saved under `results/logs/`.
+result parsing, and report generation) and finishes by regenerating three
+artifacts under `results/`:
+
+- `results.csv` - raw numbers (re-runs update rows, never duplicate them)
+- `report.html` - self-contained HTML report with summary tables and 6
+  bar charts (Read/Write IOPS in `k`, Read/Write Throughput in `MiB/s`,
+  Read/Write Latency in `µs`). Open directly in a browser.
+- `results.md` - markdown-friendly summary tables (embeds HTML for the
+  two-level headers, renders correctly on GitHub / VS Code preview).
+
+Per-test fio logs are kept under `results/logs/`.
 
 Charts are rendered with matplotlib (as inline SVG) if it's installed
 (`pip install -r requirements.txt`); otherwise `generate_report.py`
 automatically falls back to a small dependency-free SVG renderer, so the
 report always regenerates with zero manual steps either way.
+
+v2 volumes are benchmarked against **both** SPDK bdev backends, driven by
+two separate per-node disk arrays in run.sh:
+
+- `NVME_BDEV_DISKS` - PCI BDF paths (e.g. `0000:00:0b.0`) - runs first, as
+  NVMe bdev. Labeled `v2 volume (NVMe-OF frontend, NVMe bdev, ...)`.
+- `AIO_BDEV_DISKS` - block device paths (e.g. `/dev/nvme3n1`) - runs next,
+  as AIO bdev. Labeled `v2 volume (NVMe-OF frontend, AIO bdev, ...)`.
+
+Set either array to `()` to skip that backend. Each backend runs the full
+`CPU_MASKS x {1 replica, 1 cross-node replica, 3 replicas}` matrix.
+
+v1 volumes use filesystem disks configured via `FILESYSTEM_DISKS` in run.sh
+(default `/mnt/disk` on every node). The suite ensures the corresponding
+Longhorn filesystem disk exists on each node before v1 benchmarks start
+(idempotent - existing disks with the same path, e.g. a Longhorn default
+disk, are left alone). Set to `()` to skip auto-provisioning if the disks
+are already pre-configured on the cluster.
 
 `fio.yaml`'s `nodeSelector` is patched automatically on every run (never
 edit it by hand). By default the fio pod runs on `NODES[0]`; change
