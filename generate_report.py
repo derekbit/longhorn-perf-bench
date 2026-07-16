@@ -473,7 +473,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Longhorn Performance Benchmark Report</title>
+<title>{title}</title>
 <style>
   /* Landscape A3 gives the summary tables and the 2-column chart grid enough
      horizontal room to render without breaking words. Only weasyprint honors
@@ -504,8 +504,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>Longhorn Performance Benchmark Report</h1>
-  <p class="generated-at">Generated at {generated_at} from {csv_path}</p>
+  <h1>{title}</h1>
+  <p class="generated-at">Generated at {generated_at}</p>
 
   {sections}
 </body>
@@ -524,15 +524,15 @@ SECTION_TEMPLATE = """  <h2>Access mode: {access_mode}</h2>
 """
 
 
-def build_markdown(csv_path, ordered_access_modes, sections, md_out, svg_files_by_am):
+def build_markdown(csv_path, ordered_access_modes, sections, md_out, svg_files_by_am, title):
     """Render results.md with one section per access mode.
 
     svg_files_by_am is a dict: access_mode -> chart_key -> svg_path.
     """
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    generated_at = datetime.now().strftime("%Y-%m-%d")
     parts = [
-        "# Longhorn Performance Benchmark Results\n",
-        f"_Generated at {generated_at} from `{csv_path}`._\n",
+        f"# {title}\n",
+        f"_Generated at {generated_at}._\n",
     ]
 
     # Compute a relative path from the markdown file to the svg directory so
@@ -574,7 +574,7 @@ def build_markdown(csv_path, ordered_access_modes, sections, md_out, svg_files_b
     return "".join(parts)
 
 
-def write_empty_outputs(html_out, md_out, pdf_out, csv_path):
+def write_empty_outputs(html_out, md_out, pdf_out, csv_path, title):
     with open(html_out, "w") as f:
         f.write(
             "<!DOCTYPE html><html><body>"
@@ -584,7 +584,7 @@ def write_empty_outputs(html_out, md_out, pdf_out, csv_path):
     if md_out:
         with open(md_out, "w") as f:
             f.write(
-                "# Longhorn Performance Benchmark Results\n\n"
+                f"# {title}\n\n"
                 f"_No benchmark results found in `{csv_path}` yet. "
                 "Run `./run.sh run <v1|v2|all>` first._\n"
             )
@@ -622,7 +622,15 @@ def main():
     parser.add_argument("--pdf", default="results/report.pdf",  help="Path to write report.pdf (requires weasyprint)")
     parser.add_argument("--svg-dir", default="results/charts",
                         help="Directory to write one standalone SVG per bar chart (subdirectories per access mode)")
+    parser.add_argument("--longhorn-version", default="",
+                        help="Longhorn version string (e.g. 'v1.12.0') to include in the report title. "
+                             "Typically sourced from `kubectl -n longhorn-system get setting.longhorn.io "
+                             "current-longhorn-version -o jsonpath='{.value}'`.")
     args = parser.parse_args()
+
+    report_title = "Longhorn Performance Benchmark Report"
+    if args.longhorn_version:
+        report_title = f"Longhorn {args.longhorn_version} Performance Benchmark Report"
 
     for out in (args.out, args.md, args.pdf):
         if not out:
@@ -636,7 +644,7 @@ def main():
     ordered_access_modes, sections = load_results(args.csv)
 
     if not ordered_access_modes:
-        write_empty_outputs(args.out, args.md, args.pdf, args.csv)
+        write_empty_outputs(args.out, args.md, args.pdf, args.csv, report_title)
         print(f"\u26a0\ufe0f  No results found in {args.csv}; wrote empty {args.out} and {args.md}")
         return
 
@@ -702,8 +710,8 @@ def main():
         )
 
     html_doc = PAGE_TEMPLATE.format(
-        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        csv_path=html.escape(args.csv),
+        title=html.escape(report_title),
+        generated_at=datetime.now().strftime("%Y-%m-%d"),
         sections="".join(section_htmls),
     )
     with open(args.out, "w") as f:
@@ -716,7 +724,7 @@ def main():
 
     if args.md:
         with open(args.md, "w") as f:
-            f.write(build_markdown(args.csv, ordered_access_modes, sections, args.md, svg_files_by_am))
+            f.write(build_markdown(args.csv, ordered_access_modes, sections, args.md, svg_files_by_am, report_title))
         print(f"\u2705 Markdown report generated: {os.path.abspath(args.md)}")
 
     if args.pdf:
