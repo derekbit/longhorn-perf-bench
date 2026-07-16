@@ -54,13 +54,19 @@ Longhorn filesystem disk exists on each node before v1 benchmarks start
 disk, are left alone). Set to `()` to skip auto-provisioning if the disks
 are already pre-configured on the cluster.
 
-`fio.yaml`'s `nodeSelector` is patched automatically on every run (never
-edit it by hand). By default the fio pod runs on `NODES[0]`; change
+The upstream [longhorn/kbench](https://github.com/longhorn/kbench)
+`fio.yaml` is fetched fresh into `tmp/fio.yaml` on every `./run.sh run`
+(this repo does not maintain its own copy). Its `nodeSelector` is then
+patched automatically per run - never edit `tmp/fio.yaml` by hand, it is
+overwritten every run. By default the fio pod runs on `NODES[0]`; change
 `FIO_NODE_INDEX` in run.sh to use a different node (e.g. `FIO_NODE_INDEX=2`
 to run fio on the third node instead). The "cross-node replica" scenarios
 automatically place the replica's disk on the *next* node in `NODES`
 (wrapping around), e.g. volume on node 0 -> replica on node 1; volume on
 node 2 -> replica on node 0.
+
+To pin a fork or a specific commit of the upstream template, override
+`FIO_YAML_URL` in run.sh.
 
 `storageclass/*.yaml`'s `parameters.shareManagerNodeSelector` is likewise
 patched automatically to pin each Longhorn StorageClass's share-manager to
@@ -68,9 +74,13 @@ patched automatically to pin each Longhorn StorageClass's share-manager to
 - change `SHARE_MANAGER_POD_NODE_INDEX` in run.sh to use a different node),
 before the storage classes are (re)applied on every run.
 
-The fio PVC's `accessModes` is also configurable via `FIO_ACCESS_MODE` in
-run.sh (default `ReadWriteOnce`; only Longhorn v1 StorageClasses support
-`ReadWriteMany`).
+The fio PVC's `accessModes` is configurable via `FIO_ACCESS_MODES` (an
+array) in run.sh. Defaults to `("ReadWriteOnce" "ReadWriteMany")` - the
+full suite is run once per entry, and the report groups results into one
+section per access mode (RWO first, then RWX). Both Longhorn v1 and v2
+StorageClasses support `ReadWriteMany` via a share-manager; the local-path
+baseline is RWO-only (hostPath) and is skipped automatically under RWX
+with a warning.
 
 ## Project layout
 
@@ -80,15 +90,18 @@ lib/log.sh              Logging helpers + generic retry/poll utilities
 lib/k8s.sh               Longhorn/Kubernetes control-plane helpers
                           (data engines, node disks, node scheduling)
 lib/fio.sh               fio job templating, execution, result parsing,
-                          and CSV recording
+                          CSV recording, and fio.yaml downloading
 lib/benchmarks.sh        Benchmark scenarios (baseline, v1, v2) + orchestration
-generate_report.py        Renders results/results.csv into results/report.html
-                          (matplotlib SVG charts if installed, otherwise a
-                          built-in dependency-free SVG renderer)
-requirements.txt          Optional: matplotlib, for nicer charts
-fio.yaml                  fio Job/PVC template (patched per-run by lib/fio.sh)
+generate_report.py        Renders results/results.csv into results/report.html,
+                          results/report.pdf and results/results.md
+                          (matplotlib SVG charts + WeasyPrint PDF if
+                          installed, otherwise a built-in dependency-free
+                          SVG renderer and no PDF)
+requirements.txt          Optional: matplotlib (charts) + weasyprint (PDF)
 storageclass/             Longhorn StorageClass manifests for each scenario
 local-path-storage.yaml   local-path-provisioner manifest (used as baseline)
+tmp/fio.yaml              Downloaded per run from upstream longhorn/kbench,
+                          then patched by lib/fio.sh (git-ignored)
 ```
 
 Re-running `run.sh run <engine>` updates (rather than duplicates) matching

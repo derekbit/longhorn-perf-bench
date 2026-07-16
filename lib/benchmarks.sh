@@ -5,9 +5,14 @@
 # Requires lib/log.sh, lib/k8s.sh and lib/fio.sh to be sourced first, and the
 # following globals to be set by run.sh: NODES, FILESYSTEM_DISKS,
 # NVME_BDEV_DISKS, AIO_BDEV_DISKS, CPU_MASKS, RUN_BASELINE, FIO_NODE,
-# FIO_NODE_INDEX, VOLUME_ATTACH_NODE, VOLUME_ATTACH_NODE_INDEX,
-# CROSSNODE_NODE, CROSSNODE_DISK_INDEX, SHARE_MANAGER_POD_NODE,
-# MODE_1_REPLICA, MODE_1_REPLICA_CROSSNODE, MODE_3_REPLICAS.
+# FIO_NODE_INDEX, SHARE_MANAGER_POD_NODE, SHARE_MANAGER_POD_NODE_INDEX,
+# FIO_ACCESS_MODES, MODE_1_REPLICA, MODE_1_REPLICA_CROSSNODE,
+# MODE_3_REPLICAS.
+#
+# The per-iteration globals FIO_ACCESS_MODE, VOLUME_ATTACH_NODE,
+# VOLUME_ATTACH_NODE_INDEX, CROSSNODE_NODE and CROSSNODE_DISK_INDEX are
+# (re)computed by set_access_mode_context() at the start of each access-mode
+# iteration in run().
 
 # ---------------------------------------------------------------------------
 # Helpers for v2 volume labeling
@@ -51,13 +56,14 @@ function benchmark_baseline_volume() {
     run_fio "local-path" "$FIO_NODE" "$LABEL" "$MODE_1_REPLICA" || exit 1
 
     # The baseline has no replica concept, so mirror the same numbers across
-    # every replica-mode column for a fair side-by-side comparison.
+    # every replica-mode column for a fair side-by-side comparison. Look up
+    # the row we just recorded, keyed on (access_mode, label, mode).
     local ROW
-    ROW=$(awk -F',' -v label="$LABEL" -v mode="$MODE_1_REPLICA" \
-        '$1==label && $2==mode {print; exit}' "$RESULTS_CSV")
+    ROW=$(awk -F',' -v am="$FIO_ACCESS_MODE" -v label="$LABEL" -v mode="$MODE_1_REPLICA" \
+        '$1==am && $2==label && $3==mode {print; exit}' "$RESULTS_CSV")
 
     local RR_IOPS RW_IOPS SR_KIBPS SW_KIBPS RR_LAT RW_LAT
-    IFS=',' read -r _ _ RR_IOPS RW_IOPS SR_KIBPS SW_KIBPS RR_LAT RW_LAT <<< "$ROW"
+    IFS=',' read -r _ _ _ RR_IOPS RW_IOPS SR_KIBPS SW_KIBPS RR_LAT RW_LAT <<< "$ROW"
 
     record_result "$LABEL" "$MODE_1_REPLICA_CROSSNODE" "$RR_IOPS" "$RW_IOPS" "$SR_KIBPS" "$SW_KIBPS" "$RR_LAT" "$RW_LAT"
     record_result "$LABEL" "$MODE_3_REPLICAS" "$RR_IOPS" "$RW_IOPS" "$SR_KIBPS" "$SW_KIBPS" "$RR_LAT" "$RW_LAT"
@@ -214,21 +220,87 @@ function run_v2_benchmarks() {
 function run() {
     local DATA_ENGINE="$1"
 
+    # Fetch a fresh copy of the upstream fio.yaml template; we don't track
+    # it in this repo. All per-run edits (storageClassName, accessModes,
+    # nodeSelector) are then applied by lib/fio.sh helpers.
+    download_fio_yaml || exit 1
+
     log_step "Resetting Longhorn storage classes..."
     set_storageclasses_share_manager_node "$SHARE_MANAGER_POD_NODE" || exit 1
     kubectl delete -f "${SCRIPT_DIR}/storageclass/" --ignore-not-found
     kubectl apply -f "${SCRIPT_DIR}/storageclass/"
 
-    if [[ "$RUN_BASELINE" == true ]]; then
-        install_local_path_provisioner || exit 1
+    local ACCESS_MODE
+    for ACCESS_MODE in "${FIO_ACCESS_MODES[@]}"; do
+        set_access_mode_context "$ACCESS_MODE" || exit 1
 
-        log_run "Benchmarking local-path provisioner (baseline)..."
-        benchmark_baseline_volume || exit 1
+        log_step "========================================================="
+        log_step "Running benchmarks with access mode: ${ACCESS_MODE}"
+        log_step "  FIO_NODE=${FIO_NODE}  VOLUME_ATTACH_NODE=${VOLUME_ATTACH_NODE}  CROSSNODE_NODE=${CROSSNODE_NODE}"
+        log_step "========================================================="
+
+        run_for_access_mode "$DATA_ENGINE" "$ACCESS_MODE" || exit 1
+    done
+
+    generate_report
+}
+
+# set_access_mode_context <access_mode> - populates the per-iteration
+# globals that the benchmark functions read (FIO_ACCESS_MODE + the derived
+# VOLUME_ATTACH_* / CROSSNODE_* pair).
+function set_access_mode_context() {
+    local ACCESS_MODE="$1"
+
+    case "$ACCESS_MODE" in
+        ReadWriteOnce|ReadWriteMany) ;;
+        *) log_error "Unsupported access mode '${ACCESS_MODE}'."; return 1 ;;
+    esac
+
+    FIO_ACCESS_MODE="$ACCESS_MODE"
+
+    # Under RWX the engine follows the share-manager pod, so the "volume
+    # attach node" moves to SHARE_MANAGER_POD_NODE. Under RWO it stays on
+    # the fio pod's node.
+    if [[ "$ACCESS_MODE" == "ReadWriteMany" ]]; then
+        VOLUME_ATTACH_NODE_INDEX="$SHARE_MANAGER_POD_NODE_INDEX"
+    else
+        VOLUME_ATTACH_NODE_INDEX="$FIO_NODE_INDEX"
+    fi
+    CROSSNODE_DISK_INDEX=$(( (VOLUME_ATTACH_NODE_INDEX + 1) % ${#NODES[@]} ))
+    VOLUME_ATTACH_NODE="${NODES[$VOLUME_ATTACH_NODE_INDEX]}"
+    CROSSNODE_NODE="${NODES[$CROSSNODE_DISK_INDEX]}"
+}
+
+# run_for_access_mode <v1|v2|all> <access_mode> - runs the benchmark
+# subsets that are compatible with the given access mode.
+#
+# The local-path baseline is intrinsically RWO-only (hostPath backing), so
+# it is skipped under RWX with a warning. Both Longhorn v1 and v2
+# StorageClasses support RWX via a share-manager (see
+# storageclass/*.yaml's shareManagerNodeSelector), so both engines run
+# under every access mode.
+function run_for_access_mode() {
+    local DATA_ENGINE="$1" ACCESS_MODE="$2"
+    local IS_RWX=false
+    [[ "$ACCESS_MODE" == "ReadWriteMany" ]] && IS_RWX=true
+
+    if [[ "$RUN_BASELINE" == true ]]; then
+        if $IS_RWX; then
+            log_warn "Skipping local-path baseline under ${ACCESS_MODE} (local-path is RWO-only)."
+        else
+            install_local_path_provisioner || exit 1
+            log_run "Benchmarking local-path provisioner (baseline)..."
+            benchmark_baseline_volume || exit 1
+        fi
     fi
 
     case "$DATA_ENGINE" in
-        v1)  run_v1_benchmarks || exit 1 ;;
-        v2)  run_v2_benchmarks || exit 1 ;;
+        v1)
+            run_v1_benchmarks || exit 1
+            ;;
+        v2)
+            run_v2_benchmarks || exit 1
+            ;;
         all)
             run_v1_benchmarks || exit 1
             run_v2_benchmarks || exit 1
@@ -237,8 +309,6 @@ function run() {
             die "Invalid data engine '${DATA_ENGINE}'. Use 'v1', 'v2' or 'all'."
             ;;
     esac
-
-    generate_report
 }
 
 function reset() {

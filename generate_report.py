@@ -31,6 +31,22 @@ try:
 except ImportError:
     HAS_MPL = False
 
+try:
+    import weasyprint
+
+    HAS_WEASYPRINT = True
+except ImportError:
+    HAS_WEASYPRINT = False
+
+# Canonical top-to-bottom section order for access modes. Any access mode
+# found in the CSV that isn't in this list is appended afterwards, in
+# first-seen order.
+CANONICAL_ACCESS_MODES = ["ReadWriteOnce", "ReadWriteMany"]
+
+# Access mode assigned to legacy 8-column rows (without an access_mode
+# column) - matches the previous default in run.sh.
+LEGACY_DEFAULT_ACCESS_MODE = "ReadWriteOnce"
+
 # Fixed left-to-right column order for replica modes. Any mode found in the
 # CSV that isn't in this list is appended afterwards, in first-seen order.
 CANONICAL_MODES = ["1 replica", "1 cross-node replica", "3 replicas"]
@@ -86,42 +102,86 @@ V2_LABEL_RE = re.compile(
 
 
 def load_results(csv_path):
-    labels = []
-    modes = []
-    raw = OrderedDict()  # label -> mode -> {csv_field: float}
+    """Load results.csv grouped by access mode.
+
+    Returns (ordered_access_modes, sections) where sections is an
+    OrderedDict mapping access_mode -> {"labels": [...], "modes": [...],
+    "raw": OrderedDict(label -> mode -> {csv_field: float})}.
+
+    Legacy 8-column rows (without an access_mode column) are transparently
+    tagged with LEGACY_DEFAULT_ACCESS_MODE.
+    """
+    sections = OrderedDict()
 
     if not os.path.exists(csv_path):
-        return labels, modes, raw
+        return [], sections
 
     csv_fields = {chart["csv_field"] for chart in CHARTS}
 
     with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            label = (row.get("label") or "").strip()
-            mode = (row.get("replica_mode") or "").strip()
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return [], sections
+
+        has_access_mode = header and header[0] == "access_mode"
+        if has_access_mode:
+            data_header = header[1:]
+        else:
+            data_header = header
+
+        col_idx = {name: i for i, name in enumerate(data_header)}
+        label_idx = col_idx.get("label")
+        mode_idx = col_idx.get("replica_mode")
+        if label_idx is None or mode_idx is None:
+            return [], sections
+
+        for raw_row in reader:
+            if not raw_row:
+                continue
+            if has_access_mode:
+                access_mode = (raw_row[0] or "").strip() or LEGACY_DEFAULT_ACCESS_MODE
+                row = raw_row[1:]
+            else:
+                access_mode = LEGACY_DEFAULT_ACCESS_MODE
+                row = raw_row
+
+            if len(row) <= max(label_idx, mode_idx):
+                continue
+            label = (row[label_idx] or "").strip()
+            mode = (row[mode_idx] or "").strip()
             if not label or not mode:
                 continue
 
-            if label not in raw:
-                raw[label] = {}
-                labels.append(label)
-            if mode not in modes:
-                modes.append(mode)
+            section = sections.setdefault(
+                access_mode, {"labels": [], "modes": [], "raw": OrderedDict()}
+            )
+            if label not in section["raw"]:
+                section["raw"][label] = {}
+                section["labels"].append(label)
+            if mode not in section["modes"]:
+                section["modes"].append(mode)
 
             metrics = {}
             for field in csv_fields:
-                value = row.get(field, "")
+                i = col_idx.get(field)
+                value = row[i] if (i is not None and i < len(row)) else ""
                 try:
                     metrics[field] = float(value)
                 except (TypeError, ValueError):
                     metrics[field] = None
-            raw[label][mode] = metrics
+            section["raw"][label][mode] = metrics
 
-    ordered_modes = [m for m in CANONICAL_MODES if m in modes]
-    ordered_modes += [m for m in modes if m not in ordered_modes]
+    for section in sections.values():
+        ordered = [m for m in CANONICAL_MODES if m in section["modes"]]
+        ordered += [m for m in section["modes"] if m not in ordered]
+        section["modes"] = ordered
 
-    return labels, ordered_modes, raw
+    ordered_access_modes = [am for am in CANONICAL_ACCESS_MODES if am in sections]
+    ordered_access_modes += [am for am in sections if am not in ordered_access_modes]
+
+    return ordered_access_modes, sections
 
 
 def raw_value(raw, label, mode, csv_field):
@@ -415,38 +475,60 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Longhorn Performance Benchmark Report</title>
 <style>
+  /* Landscape A3 gives the summary tables and the 2-column chart grid enough
+     horizontal room to render without breaking words. Only weasyprint honors
+     @page; browsers ignore it, so on-screen HTML stays fluid-width. */
+  @page {{ size: A3 landscape; margin: 12mm; }}
   body {{ font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin: 24px; color: #222; }}
   h1 {{ margin-bottom: 4px; }}
   .generated-at {{ color: #666; margin-top: 0; margin-bottom: 24px; }}
-  h2 {{ border-bottom: 2px solid #ddd; padding-bottom: 6px; margin-top: 40px; }}
-  table.results-table {{ border-collapse: collapse; margin: 16px 0 32px; width: 100%; font-size: 13px; }}
+  h2 {{ border-bottom: 2px solid #444; padding-bottom: 6px; margin-top: 48px; color: #2c3e50;
+        page-break-before: always; break-before: page; page-break-after: avoid; break-after: avoid; }}
+  h2:first-of-type {{ page-break-before: auto; break-before: auto; }}
+  h3 {{ border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-top: 28px;
+        page-break-after: avoid; break-after: avoid; }}
+  table.results-table {{ border-collapse: collapse; margin: 16px 0 32px; width: 100%; font-size: 13px;
+                         table-layout: auto; page-break-inside: avoid; break-inside: avoid; }}
   table.results-table caption {{ text-align: left; font-weight: bold; font-size: 14px; margin-bottom: 6px; }}
-  table.results-table th, table.results-table td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: right; }}
-  table.results-table th.row-label {{ text-align: left; background: #f2e9f7; }}
+  table.results-table th, table.results-table td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: right;
+                                                    white-space: nowrap; }}
+  table.results-table th.row-label, table.results-table td.row-label {{ text-align: left; background: #f2e9f7;
+                                                                        white-space: nowrap; }}
   table.results-table thead th {{ background: #ecdff5; text-align: center; }}
   table.results-table tbody tr:nth-child(even) {{ background: #fafafa; }}
-  .charts-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(560px, 1fr)); gap: 16px; }}
-  .chart-card {{ border: 1px solid #ddd; border-radius: 6px; padding: 8px; }}
+  .charts-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }}
+  .chart-card {{ border: 1px solid #ddd; border-radius: 6px; padding: 8px; min-width: 0;
+                 page-break-inside: avoid; break-inside: avoid; }}
   .chart-card svg {{ width: 100%; height: auto; }}
+  .section-empty {{ color: #777; font-style: italic; margin: 12px 0 32px; }}
 </style>
 </head>
 <body>
   <h1>Longhorn Performance Benchmark Report</h1>
   <p class="generated-at">Generated at {generated_at} from {csv_path}</p>
 
-  <h2>Summary Tables</h2>
-  {tables}
-
-  <h2>Charts</h2>
-  <div class="charts-grid">
-    {charts}
-  </div>
+  {sections}
 </body>
 </html>
 """
 
+SECTION_TEMPLATE = """  <h2>Access mode: {access_mode}</h2>
 
-def build_markdown(csv_path, labels, modes, raw, md_out, svg_dir, svg_files):
+  <h3>Summary Tables</h3>
+  {tables}
+
+  <h3>Charts</h3>
+  <div class="charts-grid">
+    {charts}
+  </div>
+"""
+
+
+def build_markdown(csv_path, ordered_access_modes, sections, md_out, svg_files_by_am):
+    """Render results.md with one section per access mode.
+
+    svg_files_by_am is a dict: access_mode -> chart_key -> svg_path.
+    """
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     parts = [
         "# Longhorn Performance Benchmark Results\n",
@@ -463,25 +545,36 @@ def build_markdown(csv_path, labels, modes, raw, md_out, svg_dir, svg_files):
         except ValueError:
             return svg_path
 
-    for group in TABLE_GROUPS:
-        parts.append(f"\n## {group['caption']}\n")
-        parts.append(build_md_html_table(group, labels, modes, raw))
+    for access_mode in ordered_access_modes:
+        section = sections[access_mode]
+        labels = section["labels"]
+        modes = section["modes"]
+        raw = section["raw"]
+        svg_files = svg_files_by_am.get(access_mode, {})
 
-        chart_lines = []
-        for chart_key, header in ((group["read"], group["read_header"]),
-                                  (group["write"], group["write_header"])):
-            svg_path = svg_files.get(chart_key)
-            if svg_path:
-                chart_lines.append(
-                    f"![{header}]({rel(svg_path)})"
-                )
-        if chart_lines:
-            parts.append("\n" + "\n\n".join(chart_lines) + "\n")
+        parts.append(f"\n## Access mode: {access_mode}\n")
+
+        if not labels:
+            parts.append("\n_No results recorded for this access mode._\n")
+            continue
+
+        for group in TABLE_GROUPS:
+            parts.append(f"\n### {group['caption']}\n")
+            parts.append(build_md_html_table(group, labels, modes, raw))
+
+            chart_lines = []
+            for chart_key, header in ((group["read"], group["read_header"]),
+                                      (group["write"], group["write_header"])):
+                svg_path = svg_files.get(chart_key)
+                if svg_path:
+                    chart_lines.append(f"![{header}]({rel(svg_path)})")
+            if chart_lines:
+                parts.append("\n" + "\n\n".join(chart_lines) + "\n")
 
     return "".join(parts)
 
 
-def write_empty_outputs(html_out, md_out, csv_path):
+def write_empty_outputs(html_out, md_out, pdf_out, csv_path):
     with open(html_out, "w") as f:
         f.write(
             "<!DOCTYPE html><html><body>"
@@ -495,6 +588,30 @@ def write_empty_outputs(html_out, md_out, csv_path):
                 f"_No benchmark results found in `{csv_path}` yet. "
                 "Run `./run.sh run <v1|v2|all>` first._\n"
             )
+    if pdf_out and os.path.exists(pdf_out):
+        try:
+            os.remove(pdf_out)
+        except OSError:
+            pass
+
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def slugify(name):
+    return _SLUG_RE.sub("_", name).strip("_") or "section"
+
+
+def render_pdf(html_out, pdf_out):
+    if not HAS_WEASYPRINT:
+        print(
+            "\u2139\ufe0f  weasyprint not found; skipping PDF generation. "
+            "Run `pip install weasyprint` (or `pip install -r requirements.txt`) to enable it."
+        )
+        return False
+    weasyprint.HTML(filename=html_out).write_pdf(pdf_out)
+    print(f"\u2705 PDF report generated: {os.path.abspath(pdf_out)}")
+    return True
 
 
 def main():
@@ -502,21 +619,24 @@ def main():
     parser.add_argument("--csv", default="results/results.csv", help="Path to results.csv")
     parser.add_argument("--out", default="results/report.html", help="Path to write report.html")
     parser.add_argument("--md",  default="results/results.md",  help="Path to write results.md")
+    parser.add_argument("--pdf", default="results/report.pdf",  help="Path to write report.pdf (requires weasyprint)")
     parser.add_argument("--svg-dir", default="results/charts",
-                        help="Directory to write one standalone SVG per bar chart")
+                        help="Directory to write one standalone SVG per bar chart (subdirectories per access mode)")
     args = parser.parse_args()
 
-    for out in (args.out, args.md):
+    for out in (args.out, args.md, args.pdf):
+        if not out:
+            continue
         out_dir = os.path.dirname(os.path.abspath(out))
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
     if args.svg_dir:
         os.makedirs(os.path.abspath(args.svg_dir), exist_ok=True)
 
-    labels, modes, raw = load_results(args.csv)
+    ordered_access_modes, sections = load_results(args.csv)
 
-    if not labels:
-        write_empty_outputs(args.out, args.md, args.csv)
+    if not ordered_access_modes:
+        write_empty_outputs(args.out, args.md, args.pdf, args.csv)
         print(f"\u26a0\ufe0f  No results found in {args.csv}; wrote empty {args.out} and {args.md}")
         return
 
@@ -524,49 +644,83 @@ def main():
         print("\u2139\ufe0f  matplotlib not found; using the built-in SVG renderer. "
               "Run `pip install matplotlib` for nicer charts.")
 
-    colors = assign_colors(labels)
+    # Build one HTML/Markdown section per access mode, and one SVG subdirectory
+    # per access mode so charts from different sections don't overwrite each other.
+    svg_files_by_am = {}
+    section_htmls = []
+    total_svg_count = 0
 
-    # HTML report - tables + charts. Render each chart once and reuse the
-    # SVG payload for both the inline HTML report and the standalone .svg
-    # files (also referenced from the markdown report).
-    html_tables = "".join(build_html_table(g, labels, modes, raw) for g in TABLE_GROUPS)
-    chart_htmls = []
-    svg_files = {}
-    for chart in CHARTS:
-        values = {
-            (label, mode): scaled_value(raw, label, mode, chart["csv_field"], chart["scale"])
-            for label in labels
-            for mode in modes
-        }
-        svg = build_bar_chart(chart["title"], chart["unit"], labels, modes, colors, values)
-        chart_htmls.append(f'<div class="chart-card">{svg}</div>')
+    for access_mode in ordered_access_modes:
+        section = sections[access_mode]
+        labels = section["labels"]
+        modes = section["modes"]
+        raw = section["raw"]
 
-        if args.svg_dir:
-            svg_path = os.path.join(os.path.abspath(args.svg_dir), f"{chart['key']}.svg")
-            with open(svg_path, "w") as f:
-                if not svg.lstrip().startswith("<?xml"):
-                    f.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
-                f.write(svg)
-            svg_files[chart["key"]] = svg_path
+        if not labels:
+            section_htmls.append(
+                f"  <h2>Access mode: {html.escape(access_mode)}</h2>\n"
+                f"  <p class=\"section-empty\">No results recorded for this access mode.</p>\n"
+            )
+            continue
+
+        colors = assign_colors(labels)
+
+        html_tables = "".join(build_html_table(g, labels, modes, raw) for g in TABLE_GROUPS)
+        chart_htmls = []
+        svg_files = {}
+
+        am_slug = slugify(access_mode)
+        am_svg_dir = os.path.join(os.path.abspath(args.svg_dir), am_slug) if args.svg_dir else None
+        if am_svg_dir:
+            os.makedirs(am_svg_dir, exist_ok=True)
+
+        for chart in CHARTS:
+            values = {
+                (label, mode): scaled_value(raw, label, mode, chart["csv_field"], chart["scale"])
+                for label in labels
+                for mode in modes
+            }
+            svg = build_bar_chart(chart["title"], chart["unit"], labels, modes, colors, values)
+            chart_htmls.append(f'<div class="chart-card">{svg}</div>')
+
+            if am_svg_dir:
+                svg_path = os.path.join(am_svg_dir, f"{chart['key']}.svg")
+                with open(svg_path, "w") as f:
+                    if not svg.lstrip().startswith("<?xml"):
+                        f.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
+                    f.write(svg)
+                svg_files[chart["key"]] = svg_path
+                total_svg_count += 1
+
+        svg_files_by_am[access_mode] = svg_files
+        section_htmls.append(
+            SECTION_TEMPLATE.format(
+                access_mode=html.escape(access_mode),
+                tables=html_tables,
+                charts="".join(chart_htmls),
+            )
+        )
 
     html_doc = PAGE_TEMPLATE.format(
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         csv_path=html.escape(args.csv),
-        tables=html_tables,
-        charts="".join(chart_htmls),
+        sections="".join(section_htmls),
     )
     with open(args.out, "w") as f:
         f.write(html_doc)
     print(f"\u2705 HTML report generated: {os.path.abspath(args.out)}")
 
-    if svg_files:
+    if total_svg_count:
         print(f"\u2705 Bar chart SVGs generated in: {os.path.abspath(args.svg_dir)} "
-              f"({len(svg_files)} files)")
+              f"({total_svg_count} files across {len(svg_files_by_am)} access mode(s))")
 
     if args.md:
         with open(args.md, "w") as f:
-            f.write(build_markdown(args.csv, labels, modes, raw, args.md, args.svg_dir, svg_files))
+            f.write(build_markdown(args.csv, ordered_access_modes, sections, args.md, svg_files_by_am))
         print(f"\u2705 Markdown report generated: {os.path.abspath(args.md)}")
+
+    if args.pdf:
+        render_pdf(args.out, args.pdf)
 
 
 if __name__ == "__main__":

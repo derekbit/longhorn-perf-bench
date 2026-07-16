@@ -44,15 +44,23 @@ NVME_BDEV_DISKS=("0000:00:0b.0" "0000:00:0b.0" "0000:00:0b.0")   # BDF format
 AIO_BDEV_DISKS=("/dev/nvme3n1" "/dev/nvme3n1" "/dev/nvme3n1")     # block device path
 CPU_MASKS=("0x1" "0x3" "0xF" "0xFF" "0xFFFF")
 
-# PVC access mode used by the fio benchmark. "ReadWriteOnce" works for every
-# StorageClass here; "ReadWriteMany" requires a Longhorn StorageClass backed
-# by a share-manager (v1) - v2 and local-path don't support RWX.
-FIO_ACCESS_MODE="ReadWriteOnce"
+# PVC access modes exercised by the benchmark. The full suite is run once
+# per entry, in order, and the report groups results into one section per
+# access mode ("ReadWriteOnce" first, then "ReadWriteMany").
+#
+# Notes on compatibility:
+#   - Both Longhorn v1 and v2 StorageClasses support "ReadWriteMany" via a
+#     share-manager (see storageclass/*.yaml's shareManagerNodeSelector).
+#     The local-path baseline is RWO-only (hostPath) and is skipped
+#     automatically under RWX with a warning.
+#   - Set to a single-element array (e.g. FIO_ACCESS_MODES=("ReadWriteOnce"))
+#     to run only one access mode.
+FIO_ACCESS_MODES=("ReadWriteOnce" "ReadWriteMany")
 
 # Which NODES[] entry actually runs the fio benchmark pod (the workload
 # node). Change this to e.g. 2 to run fio on the third node instead of the
-# first - no other edits needed, fio.yaml is patched automatically from this
-# on every run.
+# first - no other edits needed, the downloaded fio.yaml is patched
+# automatically from this on every run.
 #
 # For "cross-node replica" scenarios, the replica's disk is placed on the
 # node immediately after the *volume attach node* (wrapping around):
@@ -62,6 +70,9 @@ FIO_ACCESS_MODE="ReadWriteOnce"
 #           on (SHARE_MANAGER_POD_NODE_INDEX + 1) % ${#NODES[@]}. This is
 #           needed because the Longhorn engine attaches to the share-manager
 #           pod's node under RWX - not the fio pod's node.
+#
+# The downloaded fio.yaml's Job nodeSelector is patched automatically from
+# this on every run - no other edits needed.
 FIO_NODE_INDEX=2
 
 # Which NODES[] entry runs each Longhorn StorageClass's share-manager
@@ -82,27 +93,29 @@ if [[ "${#NODES[@]}" -lt 2 ]]; then
     exit 1
 fi
 
+if [[ "${#FIO_ACCESS_MODES[@]}" -eq 0 ]]; then
+    echo "❌ FIO_ACCESS_MODES must contain at least one entry." >&2
+    exit 1
+fi
+for _AM in "${FIO_ACCESS_MODES[@]}"; do
+    case "$_AM" in
+        ReadWriteOnce|ReadWriteMany) ;;
+        *) echo "❌ Unsupported access mode '${_AM}' in FIO_ACCESS_MODES." >&2; exit 1 ;;
+    esac
+done
+unset _AM
+
 # The "volume attach node" is where the Longhorn engine actually attaches:
 #   - RWO: the fio pod's node (engine attaches wherever the workload runs).
 #   - RWX (v1 share-manager): the share-manager pod's node (the engine
 #     attaches to the share-manager, which then serves NFS to the fio pod).
-# Cross-node replica placement and single-replica placement are derived from
-# this - otherwise, when SHARE_MANAGER_POD_NODE_INDEX happens to equal
-# (FIO_NODE_INDEX + 1) % ${#NODES[@]}, the "cross-node" replica ends up on
-# the same node as the engine.
-if [[ "$FIO_ACCESS_MODE" == "ReadWriteMany" ]]; then
-    VOLUME_ATTACH_NODE_INDEX="$SHARE_MANAGER_POD_NODE_INDEX"
-else
-    VOLUME_ATTACH_NODE_INDEX="$FIO_NODE_INDEX"
-fi
-
-CROSSNODE_DISK_INDEX=$(( (VOLUME_ATTACH_NODE_INDEX + 1) % ${#NODES[@]} ))
-
-FIO_NODE="${NODES[$FIO_NODE_INDEX]}"
-VOLUME_ATTACH_NODE="${NODES[$VOLUME_ATTACH_NODE_INDEX]}"
-CROSSNODE_NODE="${NODES[$CROSSNODE_DISK_INDEX]}"
+# Both VOLUME_ATTACH_* and CROSSNODE_* depend on the current access mode, so
+# they are (re)computed per access-mode iteration by set_access_mode_context
+# in lib/benchmarks.sh - do not read them at this scope.
 
 SHARE_MANAGER_POD_NODE="${NODES[$SHARE_MANAGER_POD_NODE_INDEX]}"
+
+FIO_NODE="${NODES[$FIO_NODE_INDEX]}"
 
 # ---------------------------------------------------------------------------
 # Timeouts / retry tuning.
@@ -120,7 +133,13 @@ FIO_TERMINATE_INTERVAL=5
 # fio job template + result output paths.
 # ---------------------------------------------------------------------------
 
-FIO_YAML="${SCRIPT_DIR}/fio.yaml"
+# fio.yaml is not maintained in this repo - it is downloaded fresh from
+# upstream longhorn/kbench on every `./run.sh run` into ${TMP_DIR}, then
+# patched in place (storageClassName / accessModes / nodeSelector) by
+# lib/fio.sh. Override FIO_YAML_URL to pin a fork or a specific commit.
+FIO_YAML_URL="https://raw.githubusercontent.com/longhorn/kbench/refs/heads/main/deploy/fio.yaml"
+TMP_DIR="${SCRIPT_DIR}/tmp"
+FIO_YAML="${TMP_DIR}/fio.yaml"
 FIO_JOB_NAME="kbench"
 
 RESULTS_DIR="${SCRIPT_DIR}/results"
@@ -128,6 +147,7 @@ RESULTS_CSV="${RESULTS_DIR}/results.csv"
 RESULTS_MD="${RESULTS_DIR}/results.md"
 RESULTS_LOG_DIR="${RESULTS_DIR}/logs"
 REPORT_HTML="${RESULTS_DIR}/report.html"
+REPORT_PDF="${RESULTS_DIR}/report.pdf"
 
 # Canonical replica-mode labels shared by lib/benchmarks.sh and the report
 # generator (order here is also the column order in the generated report).
