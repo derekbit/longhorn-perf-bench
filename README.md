@@ -3,20 +3,76 @@
 fio-based benchmark suite comparing Longhorn v1 and v2 data engine volumes
 (1 replica, 1 cross-node replica, and 3 replicas), across a range of v2
 data-engine CPU masks. Optionally also benchmarks the local-path provisioner
-as a baseline.
+as a baseline, and the v2 **sharded (erasure-coded)** volumes across a
+configurable `k+m` matrix.
 
 ## Usage
 
 ```sh
-./run.sh reset          # Reset the cluster to its default state
-./run.sh run v1          # Benchmark Longhorn v1 data engine
-./run.sh run v2          # Benchmark Longhorn v2 data engine
-./run.sh run all         # Benchmark both v1 and v2
+./run.sh reset           # Reset the cluster to its default state
+./run.sh run             # Benchmark whichever engines are listed in
+                         #   config.json's `dataEngines` (any subset of
+                         #   {v1, v2, shard}).
 ./run.sh report          # Regenerate results/report.html only
 ```
 
-Set `RUN_BASELINE=true` in run.sh to also install local-path-provisioner and
-benchmark it as a baseline on every `run` (default: `false`).
+To use a different config file, pass `-c` / `--config` (or set
+`CONFIG_FILE`):
+
+```sh
+./run.sh -c my.json run                  # CLI flag
+./run.sh --config /path/to/my.json run   # long form
+CONFIG_FILE=/path/to/my.json ./run.sh run  # env var
+```
+
+Precedence: `--config` flag > `CONFIG_FILE` env > `${SCRIPT_DIR}/config.json`.
+
+## Configuration (`config.json`)
+
+All user-tunable knobs live in [`config.json`](config.json) next to `run.sh`.
+Override the path with `-c <path>` / `--config <path>` or the `CONFIG_FILE`
+env var (see [Usage](#usage) above). Requires `jq`.
+
+Engine-specific knobs are nested under `v1` / `v2` / `shard`; each engine
+only pulls from its own sub-object. Setting a disk array to `[]` under any
+engine skips that backend for that engine.
+
+**Global**
+
+| Key                        | Type      | Purpose                                                                                                    |
+| -------------------------- | --------- | ---------------------------------------------------------------------------------------------------------- |
+| `nodes`                    | `string[]` | Cluster node names (must have ≥ 2 for cross-node tests).                                                    |
+| `fioAccessModes`           | `string[]` | PVC access modes exercised by the v1/v2 suite. Values: `"ReadWriteOnce"`, `"ReadWriteMany"`.               |
+| `fioNodeIndex`             | `integer` | Index into `nodes` for the fio workload pod.                                                                |
+| `shareManagerPodNodeIndex` | `integer` | Index into `nodes` for each StorageClass's share-manager (RWX only).                                        |
+| `runBaseline`              | `bool`    | If `true`, also install local-path-provisioner and record it as a baseline (RWO-only, skipped under RWX).   |
+| `dataEngines`              | `string[]` | Which engine suites to run this session. Any subset of `["v1", "v2", "shard"]`.                             |
+
+**`v1`** (filesystem-disk based replica volumes)
+
+| Key                | Type       | Purpose                                                                                    |
+| ------------------ | ---------- | ------------------------------------------------------------------------------------------ |
+| `filesystemDisks`  | `string[]` | Per-node filesystem-disk paths for the v1 data engine. `[]` to skip auto-provisioning.     |
+
+**`v2`** (block-disk based replica volumes)
+
+| Key             | Type       | Purpose                                                                                            |
+| --------------- | ---------- | -------------------------------------------------------------------------------------------------- |
+| `nvmeBdevDisks` | `string[]` | Per-node PCI BDF paths for the v2 NVMe bdev backend. `[]` to skip that backend.                     |
+| `aioBdevDisks`  | `string[]` | Per-node block-device paths for the v2 AIO bdev backend. `[]` to skip that backend.                 |
+| `cpuMasks`      | `string[]` | Hex CPU masks driven through the v2 data engine (e.g. `"0x1"`, `"0xFF"`).                           |
+
+**`shard`** (v2 erasure-coded volumes)
+
+| Key                | Type       | Purpose                                                                                                       |
+| ------------------ | ---------- | ------------------------------------------------------------------------------------------------------------- |
+| `nvmeBdevDisks`    | `string[]` | Per-node PCI BDF paths for the shard NVMe bdev backend. `[]` to skip that backend for shard.                   |
+| `aioBdevDisks`     | `string[]` | Per-node block-device paths for the shard AIO bdev backend. `[]` to skip that backend for shard.               |
+| `cpuMasks`         | `string[]` | Hex CPU masks driven through the shard suite.                                                                  |
+| `dataParityChunks` | `string[]` | Erasure-coding `"k+m"` schemes where `k` = `dataLayout.dataChunks` and `m` = `dataLayout.parityChunks` (e.g. `"4+2"` -> `dataChunks=4`, `parityChunks=2`). Schemes needing more nodes than `nodes[]` are skipped with a warning. |
+| `stripSizeKB`      | `integer`  | Chunk stripe size, power of two in `[4, 1024]`.                                                                |
+
+Malformed JSON or a missing file fails fast with a clear error.
 
 Every `run` is fully automated end-to-end (cluster setup, fio execution,
 result parsing, and report generation) and finishes by regenerating three
@@ -37,47 +93,63 @@ automatically falls back to a small dependency-free SVG renderer, so the
 report always regenerates with zero manual steps either way.
 
 v2 volumes are benchmarked against **both** SPDK bdev backends, driven by
-two separate per-node disk arrays in run.sh:
+`v2.nvmeBdevDisks` and `v2.aioBdevDisks` in [`config.json`](config.json):
 
-- `NVME_BDEV_DISKS` - PCI BDF paths (e.g. `0000:00:0b.0`) - runs first, as
-  NVMe bdev. Labeled `v2 volume (NVMe-OF frontend, NVMe bdev, ...)`.
-- `AIO_BDEV_DISKS` - block device paths (e.g. `/dev/nvme3n1`) - runs next,
-  as AIO bdev. Labeled `v2 volume (NVMe-OF frontend, AIO bdev, ...)`.
+- `v2.nvmeBdevDisks` - PCI BDF paths (e.g. `0000:00:0b.0`) - runs first,
+  as NVMe bdev. Labeled `v2 volume (NVMe-OF frontend, NVMe bdev, ...)`.
+- `v2.aioBdevDisks` - block device paths (e.g. `/dev/nvme3n1`) - runs
+  next, as AIO bdev. Labeled `v2 volume (NVMe-OF frontend, AIO bdev, ...)`.
 
-Set either array to `()` to skip that backend. Each backend runs the full
-`CPU_MASKS x {1 replica, 1 cross-node replica, 3 replicas}` matrix.
+Set either array to `[]` to skip that backend. Each backend runs the full
+`v2.cpuMasks x {1 replica, 1 cross-node replica, 3 replicas}` matrix.
 
-v1 volumes use filesystem disks configured via `FILESYSTEM_DISKS` in run.sh
-(default `/mnt/disk` on every node). The suite ensures the corresponding
-Longhorn filesystem disk exists on each node before v1 benchmarks start
-(idempotent - existing disks with the same path, e.g. a Longhorn default
-disk, are left alone). Set to `()` to skip auto-provisioning if the disks
-are already pre-configured on the cluster.
+v1 volumes use filesystem disks configured via `v1.filesystemDisks` in
+[`config.json`](config.json) (default `/mnt/disk` on every node). The suite
+ensures the corresponding Longhorn filesystem disk exists on each node
+before v1 benchmarks start (idempotent - existing disks with the same path,
+e.g. a Longhorn default disk, are left alone). Set to `[]` to skip
+auto-provisioning if the disks are already pre-configured on the cluster.
+
+Sharded (erasure-coded) v2 volumes run only when `"shard"` is listed in
+`dataEngines`. The suite iterates `shard.dataParityChunks` (default: `1+1
+2+1 4+1 1+2 2+2 4+2`) over whichever of `shard.nvmeBdevDisks` /
+`shard.aioBdevDisks` are non-empty, sweeping `shard.cpuMasks`, with the
+chunk stripe size fixed by `shard.stripSizeKB` (default: `64`). Each
+scheme spreads chunks across `k+m` nodes (one shard per node), so entries
+needing more nodes than are available in `nodes[]` are skipped at runtime
+with a warning. Shard results render as their own section ("Sharded
+volumes (v2 erasure coding)") in the report, with one column per `k+m`
+scheme, independent of the v1/v2 replica scenarios above. The upstream
+reference is
+[longhorn/examples/v2/sharding](https://github.com/longhorn/longhorn/tree/master/examples/v2/sharding).
 
 The upstream [longhorn/kbench](https://github.com/longhorn/kbench)
 `fio.yaml` is fetched fresh into `tmp/fio.yaml` on every `./run.sh run`
 (this repo does not maintain its own copy). Its `nodeSelector` is then
 patched automatically per run - never edit `tmp/fio.yaml` by hand, it is
-overwritten every run. By default the fio pod runs on `NODES[0]`; change
-`FIO_NODE_INDEX` in run.sh to use a different node (e.g. `FIO_NODE_INDEX=2`
-to run fio on the third node instead). The "cross-node replica" scenarios
-automatically place the replica's disk on the *next* node in `NODES`
-(wrapping around), e.g. volume on node 0 -> replica on node 1; volume on
-node 2 -> replica on node 0.
+overwritten every run. By default the fio pod runs on `nodes[0]`; change
+`fioNodeIndex` in [`config.json`](config.json) to use a different node
+(e.g. `"fioNodeIndex": 2` to run fio on the third node instead). The
+"cross-node replica" scenarios automatically place the replica's disk on
+the *next* node in `nodes` (wrapping around), e.g. volume on node 0 ->
+replica on node 1; volume on node 2 -> replica on node 0.
 
 To pin a fork or a specific commit of the upstream template, override
 `FIO_YAML_URL` in run.sh.
 
-`storageclass/*.yaml`'s `parameters.shareManagerNodeSelector` is likewise
-patched automatically to pin each Longhorn StorageClass's share-manager to
-`SHARE_MANAGER_POD_NODE` (default `NODES[0]`, independent of `FIO_NODE_INDEX`
-- change `SHARE_MANAGER_POD_NODE_INDEX` in run.sh to use a different node),
-before the storage classes are (re)applied on every run.
+The tracked `storageclass/*.yaml.tmpl` files are rendered fresh into
+`tmp/storageclass/*.yaml` on every run, with
+`parameters.shareManagerNodeSelector` set to pin each Longhorn StorageClass's
+share-manager to the node at index `shareManagerPodNodeIndex` (default
+`nodes[0]`, independent of `fioNodeIndex`), before the storage classes are
+(re)applied. The tracked templates themselves are never modified, so
+`git status` stays clean across runs.
 
-The fio PVC's `accessModes` is configurable via `FIO_ACCESS_MODES` (an
-array) in run.sh. Defaults to `("ReadWriteOnce" "ReadWriteMany")` - the
-full suite is run once per entry, and the report groups results into one
-section per access mode (RWO first, then RWX). Both Longhorn v1 and v2
+The fio PVC's `accessModes` is configurable via `fioAccessModes` (an
+array) in [`config.json`](config.json). Defaults to `["ReadWriteOnce",
+"ReadWriteMany"]` - the full v1/v2 suite is run once per entry, and the
+report groups results into one section per access mode (RWO first, then
+RWX). Both Longhorn v1 and v2
 StorageClasses support `ReadWriteMany` via a share-manager; the local-path
 baseline is RWO-only (hostPath) and is skipped automatically under RWX
 with a warning.

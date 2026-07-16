@@ -231,8 +231,17 @@ PY
 function run_fio() {
     local STORAGE_CLASS="$1" NODE="$2" LABEL="$3" MODE="$4"
 
+    # FIO_ACCESS_MODE may be a synthetic bucketing value (e.g. "Sharded") used
+    # only for the results CSV / report section. The PVC itself still needs a
+    # real Kubernetes access mode - shard volumes are RWO-only per upstream.
+    local PVC_ACCESS_MODE="$FIO_ACCESS_MODE"
+    case "$FIO_ACCESS_MODE" in
+        ReadWriteOnce|ReadWriteMany) ;;
+        *) PVC_ACCESS_MODE="ReadWriteOnce" ;;
+    esac
+
     set_fio_pvc_storage_class "$STORAGE_CLASS"
-    set_fio_pvc_access_mode "$FIO_ACCESS_MODE"
+    set_fio_pvc_access_mode "$PVC_ACCESS_MODE"
     set_fio_running_node "$NODE"
 
     kubectl apply -f "$FIO_YAML" || die "Failed to apply fio.yaml."

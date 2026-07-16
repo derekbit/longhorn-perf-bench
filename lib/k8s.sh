@@ -25,21 +25,74 @@ function install_local_path_provisioner() {
 # Longhorn StorageClasses
 # ---------------------------------------------------------------------------
 
-# set_storageclasses_share_manager_node <node> - pins each Longhorn
-# StorageClass's share-manager to <node> (the same node fio runs on), by
-# patching parameters.shareManagerNodeSelector in every storageclass/*.yaml
-# file before they get applied. Keeps the share-manager co-located with the
-# benchmark client instead of on a random node.
-function set_storageclasses_share_manager_node() {
+# render_replica_storageclasses <node> - render every replica StorageClass
+# template (storageclass/v{1,2}-r{1,3}-sc.yaml.tmpl) into
+# ${TMP_DIR}/storageclass/ with parameters.shareManagerNodeSelector set to
+# <node>. The tracked .yaml.tmpl files are never modified so the workspace
+# stays clean across runs.
+#
+# Rendered output path is the caller's contract: `kubectl apply -f
+# ${TMP_DIR}/storageclass/` picks up exactly the .yaml files produced here.
+# The shard SC template is rendered separately per iteration by
+# apply_shard_storageclass (below), so it is intentionally excluded here.
+function render_replica_storageclasses() {
     local NODE="$1"
-    export NODE
+    if [[ -z "$NODE" ]]; then
+        log_error "render_replica_storageclasses requires a node name."
+        return 1
+    fi
 
-    local SC
-    for SC in "${SCRIPT_DIR}"/storageclass/*.yaml; do
+    local OUT_DIR="${TMP_DIR}/storageclass"
+    rm -rf "$OUT_DIR"
+    mkdir -p "$OUT_DIR"
+
+    export NODE
+    local TMPL DEST
+    for TMPL in "${SCRIPT_DIR}"/storageclass/v[12]-r[13]-sc.yaml.tmpl; do
+        [[ -f "$TMPL" ]] || continue
+        DEST="${OUT_DIR}/$(basename "${TMPL%.tmpl}")"
+        cp "$TMPL" "$DEST" || return 1
         yq -i '
           .parameters.shareManagerNodeSelector = "kubernetes.io/hostname:" + strenv(NODE)
-        ' "$SC" || die "Failed to patch ${SC} with shareManagerNodeSelector."
+        ' "$DEST" || die "Failed to render ${TMPL} into ${DEST}."
     done
+    unset NODE
+}
+
+# apply_shard_storageclass <k> <m> <strip_size_kb> - renders
+# storageclass/v2-shard-sc.yaml.tmpl with the given erasure-coding
+# parameters into ${TMP_DIR}/v2-shard-sc.yaml and (re)applies it as the
+# `longhorn-v2-shard` StorageClass. The SC is delete-then-applied so each
+# iteration gets a fresh definition (StorageClass parameters are immutable
+# on some Kubernetes versions).
+function apply_shard_storageclass() {
+    local K="$1" M="$2" STRIP="$3"
+    local TMPL="${SCRIPT_DIR}/storageclass/v2-shard-sc.yaml.tmpl"
+    local RENDERED="${TMP_DIR}/v2-shard-sc.yaml"
+
+    if [[ ! -f "$TMPL" ]]; then
+        log_error "Shard StorageClass template not found: ${TMPL}"
+        return 1
+    fi
+
+    mkdir -p "$TMP_DIR"
+    cp "$TMPL" "$RENDERED" || return 1
+
+    K="$K" M="$M" STRIP="$STRIP" yq -i '
+      .parameters."dataLayout.dataChunks"   = strenv(K) |
+      .parameters."dataLayout.parityChunks" = strenv(M) |
+      .parameters."dataLayout.stripSizeKB"  = strenv(STRIP)
+    ' "$RENDERED" || die "Failed to patch ${RENDERED} with shard parameters."
+
+    kubectl delete storageclass longhorn-v2-shard --ignore-not-found >/dev/null 2>&1 || true
+    kubectl apply -f "$RENDERED" \
+        || die "Failed to apply shard StorageClass (k=${K}, m=${M}, stripSizeKB=${STRIP})."
+}
+
+# delete_shard_storageclass - best-effort cleanup of the dynamically-applied
+# shard StorageClass. Safe to call even when it doesn't exist.
+function delete_shard_storageclass() {
+    kubectl delete storageclass longhorn-v2-shard --ignore-not-found >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +360,7 @@ function add_block_disks() {
     # corresponding disk from the named array (bash nameref) to each node.
     local disks_array_name="$1"
     if [[ -z "$disks_array_name" ]]; then
-        log_error "add_block_disks requires a disks-array name (e.g. NVME_BDEV_DISKS)."
+        log_error "add_block_disks requires a disks-array name (e.g. V2_NVME_BDEV_DISKS)."
         return 1
     fi
     local -n disks_ref="$disks_array_name"

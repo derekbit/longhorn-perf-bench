@@ -40,8 +40,10 @@ except ImportError:
 
 # Canonical top-to-bottom section order for access modes. Any access mode
 # found in the CSV that isn't in this list is appended afterwards, in
-# first-seen order.
-CANONICAL_ACCESS_MODES = ["ReadWriteOnce", "ReadWriteMany"]
+# first-seen order. "Sharded" is a synthetic bucket used by the v2 shard
+# (erasure-coded) suite so its results render as their own section,
+# independent of the RWO/RWX replica-based scenarios.
+CANONICAL_ACCESS_MODES = ["ReadWriteOnce", "ReadWriteMany", "Sharded"]
 
 # Access mode assigned to legacy 8-column rows (without an access_mode
 # column) - matches the previous default in run.sh.
@@ -49,7 +51,11 @@ LEGACY_DEFAULT_ACCESS_MODE = "ReadWriteOnce"
 
 # Fixed left-to-right column order for replica modes. Any mode found in the
 # CSV that isn't in this list is appended afterwards, in first-seen order.
-CANONICAL_MODES = ["1 replica", "1 cross-node replica", "3 replicas"]
+# The k+m entries are the shard suite's erasure-coding schemes.
+CANONICAL_MODES = [
+    "1 replica", "1 cross-node replica", "3 replicas",
+    "1+1", "2+1", "4+1", "1+2", "2+2", "4+2",
+]
 
 # Chart definitions (one grouped bar chart per entry).
 # Fields:
@@ -512,7 +518,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-SECTION_TEMPLATE = """  <h2>Access mode: {access_mode}</h2>
+SECTION_TEMPLATE = """  <h2>{heading}</h2>
 
   <h3>Summary Tables</h3>
   {tables}
@@ -552,10 +558,10 @@ def build_markdown(csv_path, ordered_access_modes, sections, md_out, svg_files_b
         raw = section["raw"]
         svg_files = svg_files_by_am.get(access_mode, {})
 
-        parts.append(f"\n## Access mode: {access_mode}\n")
+        parts.append(f"\n## {section_heading(access_mode)}\n")
 
         if not labels:
-            parts.append("\n_No results recorded for this access mode._\n")
+            parts.append("\n_No results recorded for this section._\n")
             continue
 
         for group in TABLE_GROUPS:
@@ -600,6 +606,19 @@ _SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
 
 def slugify(name):
     return _SLUG_RE.sub("_", name).strip("_") or "section"
+
+
+def section_heading(access_mode):
+    """Human-readable heading for a report section.
+
+    The RWO/RWX access modes render as "Access mode: <name>" (matching the
+    long-standing wording). The synthetic "Sharded" bucket used by the v2
+    shard suite gets its own descriptive heading so it reads as a distinct
+    volume type rather than a Kubernetes access mode.
+    """
+    if access_mode == "Sharded":
+        return "Sharded volumes (v2 erasure coding)"
+    return f"Access mode: {access_mode}"
 
 
 def render_pdf(html_out, pdf_out):
@@ -666,8 +685,8 @@ def main():
 
         if not labels:
             section_htmls.append(
-                f"  <h2>Access mode: {html.escape(access_mode)}</h2>\n"
-                f"  <p class=\"section-empty\">No results recorded for this access mode.</p>\n"
+                f"  <h2>{html.escape(section_heading(access_mode))}</h2>\n"
+                f"  <p class=\"section-empty\">No results recorded for this section.</p>\n"
             )
             continue
 
@@ -703,7 +722,7 @@ def main():
         svg_files_by_am[access_mode] = svg_files
         section_htmls.append(
             SECTION_TEMPLATE.format(
-                access_mode=html.escape(access_mode),
+                heading=html.escape(section_heading(access_mode)),
                 tables=html_tables,
                 charts="".join(chart_htmls),
             )

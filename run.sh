@@ -5,17 +5,72 @@ set -o pipefail
 # Longhorn performance benchmark driver.
 #
 # Usage:
-#   ./run.sh reset             Reset the cluster to its default state.
-#   ./run.sh run v1            Benchmark baseline + Longhorn v1 data engine.
-#   ./run.sh run v2            Benchmark baseline + Longhorn v2 data engine.
-#   ./run.sh run all           Benchmark baseline + both v1 and v2.
-#   ./run.sh report            Regenerate results/report.html only.
+#   ./run.sh [-c|--config <path>] reset             Reset the cluster to its default state.
+#   ./run.sh [-c|--config <path>] run                Benchmark whichever engines are listed in
+#                                                    config.json's `dataEngines` (any subset of
+#                                                    {v1, v2, shard}).
+#   ./run.sh [-c|--config <path>] report             Regenerate results/report.html only.
+#
+# The config path can also be set via the CONFIG_FILE env var
+# (`CONFIG_FILE=... ./run.sh run`). Precedence: CLI flag > env var >
+# ${SCRIPT_DIR}/config.json.
 #
 # Each `run` regenerates results/report.html (tables + bar charts) from
 # results/results.csv - no manual steps are required to view the results.
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# CLI arg parsing.
+#
+# Parsed here (before the config loader runs) so `-c|--config <path>` can
+# switch the config file that gets loaded at global scope. Non-flag args
+# accumulate into POSITIONAL_ARGS[] and are dispatched by main() at the
+# bottom.
+# ---------------------------------------------------------------------------
+_CLI_CONFIG_FILE=""
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--config)
+            if [[ -z "$2" ]]; then
+                echo "❌ ${1} requires a path argument." >&2
+                exit 1
+            fi
+            _CLI_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --config=*)
+            _CLI_CONFIG_FILE="${1#--config=}"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [-c|--config <path>] {reset|run|report}"
+            echo "  run    Benchmark engines listed in <config>.dataEngines"
+            echo "         (any subset of {v1, v2, shard})."
+            echo "  Config precedence: --config flag > CONFIG_FILE env > ${SCRIPT_DIR}/config.json"
+            exit 0
+            ;;
+        --)
+            shift
+            POSITIONAL_ARGS+=("$@")
+            break
+            ;;
+        -*)
+            echo "❌ Unknown flag: $1" >&2
+            echo "Run '$0 --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+# CONFIG_FILE precedence: --config flag > env > default.
+CONFIG_FILE="${_CLI_CONFIG_FILE:-${CONFIG_FILE:-${SCRIPT_DIR}/config.json}}"
+unset _CLI_CONFIG_FILE
 
 # shellcheck source=lib/log.sh
 source "${SCRIPT_DIR}/lib/log.sh"
@@ -27,35 +82,79 @@ source "${SCRIPT_DIR}/lib/fio.sh"
 source "${SCRIPT_DIR}/lib/benchmarks.sh"
 
 # ---------------------------------------------------------------------------
-# Cluster topology / test matrix - edit these to match your environment.
+# Cluster topology / test matrix.
+#
+# All user-tunable knobs live in config.json (next to this script). Override
+# with `CONFIG_FILE=/path/to/other.json ./run.sh ...`.
+#
+# Schema (see config.json for defaults):
+#
+#   Top-level (global):
+#     nodes                      -> NODES                          (string array)
+#     fioAccessModes             -> FIO_ACCESS_MODES               (string array)
+#     fioNodeIndex               -> FIO_NODE_INDEX                 (integer)
+#     shareManagerPodNodeIndex   -> SHARE_MANAGER_POD_NODE_INDEX   (integer)
+#     runBaseline                -> RUN_BASELINE                   (bool)
+#     dataEngines                -> DATA_ENGINES                   (subset of {v1, v2, shard})
+#
+#   v1: { filesystemDisks }      -> FILESYSTEM_DISKS               (string array, per-node)
+#
+#   v2: { nvmeBdevDisks,         -> V2_NVME_BDEV_DISKS             (string array, per-node)
+#         aioBdevDisks,          -> V2_AIO_BDEV_DISKS              (string array, per-node)
+#         cpuMasks }             -> V2_CPU_MASKS                   (string array)
+#
+#   shard: { nvmeBdevDisks,      -> SHARD_NVME_BDEV_DISKS          (string array, per-node)
+#            aioBdevDisks,       -> SHARD_AIO_BDEV_DISKS           (string array, per-node)
+#            cpuMasks,           -> SHARD_CPU_MASKS                (string array)
+#            dataParityChunks,   -> SHARD_DATA_PARITY_CHUNKS       ("k+m" string array, k=dataChunks, m=parityChunks)
+#            stripSizeKB }       -> SHARD_STRIP_SIZE_KB            (integer, power of two 4..1024)
+#
+# Per engine, an empty disk array means "skip that bdev backend". e.g.
+# setting shard.aioBdevDisks to [] restricts the shard suite to the NVMe
+# bdev backend only.
 # ---------------------------------------------------------------------------
 
-NODES=("dereksu-bench-1" "dereksu-bench-2" "dereksu-bench-3")
-# Per-node filesystem-disk paths for the v1 data engine. Each entry is
-# ensured to exist as a Longhorn filesystem disk on the corresponding node
-# before v1 benchmarks run (idempotent - existing disks with the same path
-# are skipped). Set to () to skip auto-provisioning (expect the disks to be
-# pre-configured on the cluster).
-FILESYSTEM_DISKS=("/mnt/disk" "/mnt/disk" "/mnt/disk")
-# Per-node block-disk paths for each v2 bdev backend. The suite runs BDF disks
-# first (as NVMe bdev), then block-device paths (as AIO bdev). Set either
-# array to () to skip that bdev type.
-NVME_BDEV_DISKS=("0000:00:0b.0" "0000:00:0b.0" "0000:00:0b.0")   # BDF format
-AIO_BDEV_DISKS=("/dev/nvme3n1" "/dev/nvme3n1" "/dev/nvme3n1")     # block device path
-CPU_MASKS=("0x1" "0x3" "0xF" "0xFF" "0xFFFF")
+# CONFIG_FILE was resolved at the top of the script (CLI flag > env > default).
 
-# PVC access modes exercised by the benchmark. The full suite is run once
-# per entry, in order, and the report groups results into one section per
-# access mode ("ReadWriteOnce" first, then "ReadWriteMany").
+if ! command -v jq >/dev/null 2>&1; then
+    echo "❌ 'jq' is required to parse ${CONFIG_FILE} but is not installed." >&2
+    exit 1
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "❌ Config file not found: ${CONFIG_FILE}" >&2
+    echo "   Pass '-c <path>' / '--config <path>' or set CONFIG_FILE=... to override." >&2
+    exit 1
+fi
+
+# Fail early on malformed JSON so a typo doesn't quietly produce empty arrays.
+if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    echo "❌ ${CONFIG_FILE} is not valid JSON." >&2
+    jq empty "$CONFIG_FILE"
+    exit 1
+fi
+
+# _cfg_array <jq_path> - print each element of an array config field on its
+# own line. Empty arrays / missing keys produce no output (mapfile -> size 0).
+_cfg_array() { jq -r "${1} // [] | .[]" "$CONFIG_FILE"; }
+# _cfg_scalar <jq_path> - print a scalar config field (integer / bool / string).
+_cfg_scalar() { jq -r "${1}" "$CONFIG_FILE"; }
+
+# -- Global -----------------------------------------------------------------
+mapfile -t NODES              < <(_cfg_array '.nodes')
+
+# PVC access modes exercised by the benchmark. The full v1/v2 suite is run
+# once per entry, in order, and the report groups results into one section
+# per access mode ("ReadWriteOnce" first, then "ReadWriteMany").
 #
 # Notes on compatibility:
 #   - Both Longhorn v1 and v2 StorageClasses support "ReadWriteMany" via a
-#     share-manager (see storageclass/*.yaml's shareManagerNodeSelector).
+#     share-manager (see storageclass/*.yaml.tmpl's shareManagerNodeSelector).
 #     The local-path baseline is RWO-only (hostPath) and is skipped
 #     automatically under RWX with a warning.
-#   - Set to a single-element array (e.g. FIO_ACCESS_MODES=("ReadWriteOnce"))
-#     to run only one access mode.
-FIO_ACCESS_MODES=("ReadWriteOnce" "ReadWriteMany")
+#   - Set to a single-element array (e.g. ["ReadWriteOnce"]) to run only
+#     one access mode.
+mapfile -t FIO_ACCESS_MODES   < <(_cfg_array '.fioAccessModes')
 
 # Which NODES[] entry actually runs the fio benchmark pod (the workload
 # node). Change this to e.g. 2 to run fio on the third node instead of the
@@ -70,21 +169,57 @@ FIO_ACCESS_MODES=("ReadWriteOnce" "ReadWriteMany")
 #           on (SHARE_MANAGER_POD_NODE_INDEX + 1) % ${#NODES[@]}. This is
 #           needed because the Longhorn engine attaches to the share-manager
 #           pod's node under RWX - not the fio pod's node.
-#
-# The downloaded fio.yaml's Job nodeSelector is patched automatically from
-# this on every run - no other edits needed.
-FIO_NODE_INDEX=2
+FIO_NODE_INDEX=$(_cfg_scalar '.fioNodeIndex')
 
 # Which NODES[] entry runs each Longhorn StorageClass's share-manager
 # (parameters.shareManagerNodeSelector). Only relevant when FIO_ACCESS_MODE
-# is "ReadWriteMany". Defaults to the first node, independent of
-# FIO_NODE_INDEX.
-SHARE_MANAGER_POD_NODE_INDEX=0
+# is "ReadWriteMany". Independent of FIO_NODE_INDEX.
+SHARE_MANAGER_POD_NODE_INDEX=$(_cfg_scalar '.shareManagerPodNodeIndex')
 
 # Whether to also install local-path-provisioner and benchmark it as a
 # baseline (see the attached example report). Optional since it requires
-# applying local-path-storage.yaml; defaults to off.
-RUN_BASELINE=false
+# applying local-path-storage.yaml.
+RUN_BASELINE=$(_cfg_scalar '.runBaseline')
+
+# Which data engines to benchmark on this run. Any subset of {v1, v2,
+# shard} in any order; each entry runs its own suite. v1/v2 iterate every
+# access mode in FIO_ACCESS_MODES; "shard" is independent (RWO-only) and
+# runs once as its own report section.
+mapfile -t DATA_ENGINES       < <(_cfg_array '.dataEngines')
+
+# -- v1 (filesystem-disk based replica volumes) -----------------------------
+# Per-node filesystem-disk paths for the v1 data engine. Each entry is
+# ensured to exist as a Longhorn filesystem disk on the corresponding node
+# before v1 benchmarks run (idempotent - existing disks with the same path
+# are skipped). Set to [] to skip auto-provisioning (expect the disks to be
+# pre-configured on the cluster).
+mapfile -t FILESYSTEM_DISKS   < <(_cfg_array '.v1.filesystemDisks')
+
+# -- v2 (block-disk based replica volumes) ---------------------------------
+# Per-node block-disk paths for each v2 bdev backend. The suite runs NVMe
+# bdev (BDF paths) first, then AIO bdev (block-device paths). Set either
+# array to [] in config.json to skip that bdev type.
+mapfile -t V2_NVME_BDEV_DISKS < <(_cfg_array '.v2.nvmeBdevDisks')   # BDF format, e.g. "0000:00:0b.0"
+mapfile -t V2_AIO_BDEV_DISKS  < <(_cfg_array '.v2.aioBdevDisks')    # block device path, e.g. "/dev/nvme3n1"
+mapfile -t V2_CPU_MASKS       < <(_cfg_array '.v2.cpuMasks')
+
+# -- shard (v2 erasure-coded volumes) --------------------------------------
+# Same shape as v2, plus the erasure-coding matrix.
+#
+# Each entry in dataParityChunks is a "k+m" string where k is
+# dataLayout.dataChunks and m is dataLayout.parityChunks (e.g. "4+2" ->
+# dataChunks=4, parityChunks=2). A k+m scheme needs at least k+m nodes
+# (one shard per node, hard anti-affinity), so entries requiring more nodes
+# than are available in NODES[] are skipped at runtime with a warning.
+#
+# See https://github.com/longhorn/longhorn/tree/master/examples/v2/sharding.
+mapfile -t SHARD_NVME_BDEV_DISKS   < <(_cfg_array '.shard.nvmeBdevDisks')
+mapfile -t SHARD_AIO_BDEV_DISKS    < <(_cfg_array '.shard.aioBdevDisks')
+mapfile -t SHARD_CPU_MASKS         < <(_cfg_array '.shard.cpuMasks')
+mapfile -t SHARD_DATA_PARITY_CHUNKS < <(_cfg_array '.shard.dataParityChunks')
+# Chunk stripe size in KiB. Must be a power of two in [4, 1024]; fixed at
+# volume creation time. Applied to every shard scheme.
+SHARD_STRIP_SIZE_KB=$(_cfg_scalar '.shard.stripSizeKB')
 
 # =========================================================================
 
@@ -104,6 +239,18 @@ for _AM in "${FIO_ACCESS_MODES[@]}"; do
     esac
 done
 unset _AM
+
+if [[ "${#DATA_ENGINES[@]}" -eq 0 ]]; then
+    echo "❌ dataEngines must contain at least one of {v1, v2, shard} in ${CONFIG_FILE}." >&2
+    exit 1
+fi
+for _DE in "${DATA_ENGINES[@]}"; do
+    case "$_DE" in
+        v1|v2|shard) ;;
+        *) echo "❌ Unsupported entry '${_DE}' in dataEngines (allowed: v1, v2, shard)." >&2; exit 1 ;;
+    esac
+done
+unset _DE
 
 # The "volume attach node" is where the Longhorn engine actually attaches:
 #   - RWO: the fio pod's node (engine attaches wherever the workload runs).
@@ -169,17 +316,22 @@ main() {
             reset
             ;;
         run)
-            run "$2"
+            if [[ -n "$2" ]]; then
+                echo "ℹ️  './run.sh run <engine>' is no longer accepted; edit 'dataEngines' in ${CONFIG_FILE} instead." >&2
+                echo "   Ignoring extra argument '$2'." >&2
+            fi
+            run
             ;;
         report)
             generate_report
             ;;
         *)
-            echo "Usage: $0 {reset|run <v1|v2|all>|report}"
+            echo "Usage: $0 [-c|--config <path>] {reset|run|report}" >&2
+            echo "  run    Benchmark engines listed in ${CONFIG_FILE}'s 'dataEngines'." >&2
             exit 1
             ;;
     esac
 }
 
-main "$@"
+main "${POSITIONAL_ARGS[@]}"
 exit $?

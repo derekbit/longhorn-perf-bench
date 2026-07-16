@@ -1,0 +1,35 @@
+# Template for the Longhorn v2 sharded (erasure-coded) StorageClass.
+#
+# Like the other storageclass/*.yaml.tmpl files, this is rendered into
+# ${TMP_DIR} rather than applied in place - the .tmpl extension keeps it
+# out of any `kubectl apply -f <dir>` glob. `apply_shard_storageclass` in
+# lib/k8s.sh renders this per iteration with the current k/m/stripSizeKB
+# and applies it as `longhorn-v2-shard`.
+#
+# See https://github.com/longhorn/longhorn/tree/master/examples/v2/sharding
+# for the upstream reference.
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: longhorn-v2-shard
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  dataEngine: "v2"
+  # Erasure coding: data is split into k data + m parity chunks, spread
+  # across k+m nodes (one shard per node, hard anti-affinity). Patched at
+  # apply time by apply_shard_storageclass.
+  dataLayout.type: "sharded"
+  dataLayout.mode: "erasureCoding"
+  dataLayout.dataChunks: "1"
+  dataLayout.parityChunks: "1"
+  dataLayout.stripSizeKB: "64"
+  # Required for EC (the webhook rejects the volume otherwise):
+  #   - numberOfReplicas MUST be 1 (parity provides fault tolerance).
+  #   - dataLocality MUST be disabled (chunks span k+m nodes).
+  numberOfReplicas: "1"
+  dataLocality: "disabled"
+  staleReplicaTimeout: "2880"
+  fsType: "ext4"

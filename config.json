@@ -1,0 +1,30 @@
+{
+  "nodes": ["dereksu-bench-1", "dereksu-bench-2", "dereksu-bench-3"],
+
+  "fioAccessModes": ["ReadWriteOnce", "ReadWriteMany"],
+  "fioNodeIndex": 2,
+  "shareManagerPodNodeIndex": 0,
+
+  "runBaseline": false,
+
+  "dataEngines": ["shard"],
+
+  "v1": {
+    "filesystemDisks": ["/mnt/disk", "/mnt/disk", "/mnt/disk"]
+  },
+
+  "v2": {
+    "nvmeBdevDisks": ["0000:00:0b.0", "0000:00:0b.0", "0000:00:0b.0"],
+    "aioBdevDisks":  ["/dev/nvme3n1", "/dev/nvme3n1", "/dev/nvme3n1"],
+    "cpuMasks": ["0x1", "0x3", "0xF", "0xFF", "0xFFFF"]
+  },
+
+  "shard": {
+    "nvmeBdevDisks": ["0000:00:0b.0", "0000:00:0b.0", "0000:00:0b.0"],
+    "aioBdevDisks":  ["/dev/nvme3n1", "/dev/nvme3n1", "/dev/nvme3n1"],
+    "cpuMasks": ["0x1"],
+    "dataParityChunks": ["1+1", "2+1"],
+    "stripSizeKB": 64
+  }
+}
+
