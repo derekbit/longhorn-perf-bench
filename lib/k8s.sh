@@ -213,11 +213,11 @@ function add_filesystem_disks() {
         log_error "add_filesystem_disks requires a disks-array name (e.g. FILESYSTEM_DISKS)."
         return 1
     fi
-    local -n disks_ref="$disks_array_name"
 
     for i in "${!NODES[@]}"; do
         local NODE="${NODES[i]}"
-        local DISK="${disks_ref[i]}"
+        local DISK
+        eval "DISK=\${${disks_array_name}[\$i]}"
 
         if [[ -z "$DISK" ]]; then
             log_warn "No filesystem disk defined for node ${NODE} in ${disks_array_name}, skipping..."
@@ -363,11 +363,11 @@ function add_block_disks() {
         log_error "add_block_disks requires a disks-array name (e.g. V2_NVME_BDEV_DISKS)."
         return 1
     fi
-    local -n disks_ref="$disks_array_name"
 
     for i in "${!NODES[@]}"; do
         local NODE="${NODES[i]}"
-        local DISK="${disks_ref[i]}"
+        local DISK
+        eval "DISK=\${${disks_array_name}[\$i]}"
 
         if [[ -z "$DISK" ]]; then
             log_warn "No block disk defined for node ${NODE} in ${disks_array_name}, skipping..."

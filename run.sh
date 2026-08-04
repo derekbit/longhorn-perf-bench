@@ -135,13 +135,27 @@ if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
 fi
 
 # _cfg_array <jq_path> - print each element of an array config field on its
-# own line. Empty arrays / missing keys produce no output (mapfile -> size 0).
+# own line. Empty arrays / missing keys produce no output (read_array -> size 0).
 _cfg_array() { jq -r "${1} // [] | .[]" "$CONFIG_FILE"; }
 # _cfg_scalar <jq_path> - print a scalar config field (integer / bool / string).
 _cfg_scalar() { jq -r "${1}" "$CONFIG_FILE"; }
 
+# read_array <array_name> - portable replacement for `mapfile -t` /
+# `readarray -t`, which are Bash 4+ builtins absent from the Bash 3.2 that
+# ships with macOS. Reads newline-delimited stdin into the named array (one
+# element per line); empty input yields an empty array.
+#   Usage: read_array ARRAY_NAME < <(command)
+read_array() {
+    local __name="$1"
+    local __line
+    eval "${__name}=()"
+    while IFS= read -r __line || [[ -n "$__line" ]]; do
+        eval "${__name}+=( \"\$__line\" )"
+    done
+}
+
 # -- Global -----------------------------------------------------------------
-mapfile -t NODES              < <(_cfg_array '.nodes')
+read_array NODES              < <(_cfg_array '.nodes')
 
 # PVC access modes exercised by the benchmark. The full v1/v2 suite is run
 # once per entry, in order, and the report groups results into one section
@@ -154,7 +168,7 @@ mapfile -t NODES              < <(_cfg_array '.nodes')
 #     automatically under RWX with a warning.
 #   - Set to a single-element array (e.g. ["ReadWriteOnce"]) to run only
 #     one access mode.
-mapfile -t FIO_ACCESS_MODES   < <(_cfg_array '.fioAccessModes')
+read_array FIO_ACCESS_MODES   < <(_cfg_array '.fioAccessModes')
 
 # Which NODES[] entry actually runs the fio benchmark pod (the workload
 # node). Change this to e.g. 2 to run fio on the third node instead of the
@@ -185,7 +199,7 @@ RUN_BASELINE=$(_cfg_scalar '.runBaseline')
 # shard} in any order; each entry runs its own suite. v1/v2 iterate every
 # access mode in FIO_ACCESS_MODES; "shard" is independent (RWO-only) and
 # runs once as its own report section.
-mapfile -t DATA_ENGINES       < <(_cfg_array '.dataEngines')
+read_array DATA_ENGINES       < <(_cfg_array '.dataEngines')
 
 # -- v1 (filesystem-disk based replica volumes) -----------------------------
 # Per-node filesystem-disk paths for the v1 data engine. Each entry is
@@ -193,15 +207,15 @@ mapfile -t DATA_ENGINES       < <(_cfg_array '.dataEngines')
 # before v1 benchmarks run (idempotent - existing disks with the same path
 # are skipped). Set to [] to skip auto-provisioning (expect the disks to be
 # pre-configured on the cluster).
-mapfile -t FILESYSTEM_DISKS   < <(_cfg_array '.v1.filesystemDisks')
+read_array FILESYSTEM_DISKS   < <(_cfg_array '.v1.filesystemDisks')
 
 # -- v2 (block-disk based replica volumes) ---------------------------------
 # Per-node block-disk paths for each v2 bdev backend. The suite runs NVMe
 # bdev (BDF paths) first, then AIO bdev (block-device paths). Set either
 # array to [] in config.json to skip that bdev type.
-mapfile -t V2_NVME_BDEV_DISKS < <(_cfg_array '.v2.nvmeBdevDisks')   # BDF format, e.g. "0000:00:0b.0"
-mapfile -t V2_AIO_BDEV_DISKS  < <(_cfg_array '.v2.aioBdevDisks')    # block device path, e.g. "/dev/nvme3n1"
-mapfile -t V2_CPU_MASKS       < <(_cfg_array '.v2.cpuMasks')
+read_array V2_NVME_BDEV_DISKS < <(_cfg_array '.v2.nvmeBdevDisks')   # BDF format, e.g. "0000:00:0b.0"
+read_array V2_AIO_BDEV_DISKS  < <(_cfg_array '.v2.aioBdevDisks')    # block device path, e.g. "/dev/nvme3n1"
+read_array V2_CPU_MASKS       < <(_cfg_array '.v2.cpuMasks')
 
 # -- shard (v2 erasure-coded volumes) --------------------------------------
 # Same shape as v2, plus the erasure-coding matrix.
@@ -213,10 +227,10 @@ mapfile -t V2_CPU_MASKS       < <(_cfg_array '.v2.cpuMasks')
 # than are available in NODES[] are skipped at runtime with a warning.
 #
 # See https://github.com/longhorn/longhorn/tree/master/examples/v2/sharding.
-mapfile -t SHARD_NVME_BDEV_DISKS   < <(_cfg_array '.shard.nvmeBdevDisks')
-mapfile -t SHARD_AIO_BDEV_DISKS    < <(_cfg_array '.shard.aioBdevDisks')
-mapfile -t SHARD_CPU_MASKS         < <(_cfg_array '.shard.cpuMasks')
-mapfile -t SHARD_DATA_PARITY_CHUNKS < <(_cfg_array '.shard.dataParityChunks')
+read_array SHARD_NVME_BDEV_DISKS   < <(_cfg_array '.shard.nvmeBdevDisks')
+read_array SHARD_AIO_BDEV_DISKS    < <(_cfg_array '.shard.aioBdevDisks')
+read_array SHARD_CPU_MASKS         < <(_cfg_array '.shard.cpuMasks')
+read_array SHARD_DATA_PARITY_CHUNKS < <(_cfg_array '.shard.dataParityChunks')
 # Chunk stripe size in KiB. Must be a power of two in [4, 1024]; fixed at
 # volume creation time. Applied to every shard scheme.
 SHARD_STRIP_SIZE_KB=$(_cfg_scalar '.shard.stripSizeKB')

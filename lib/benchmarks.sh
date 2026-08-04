@@ -185,19 +185,19 @@ function run_v2_benchmarks() {
             AIO)  DISKS_ARRAY="V2_AIO_BDEV_DISKS" ;;
         esac
 
-        local -n disks_ref="$DISKS_ARRAY"
-        if [[ ${#disks_ref[@]} -eq 0 ]]; then
+        local disks_count
+        eval "disks_count=\${#${DISKS_ARRAY}[@]}"
+        if [[ "$disks_count" -eq 0 ]]; then
             log_info "Skipping ${BDEV_TYPE} bdev (${DISKS_ARRAY} is empty)."
-            unset -n disks_ref
             continue
         fi
         # VOLUME_ATTACH_DISK is the disk on the node where the engine
         # attaches (VOLUME_ATTACH_NODE) - used for the co-located 1-replica
         # benchmark. CROSSNODE_DISK is on the node immediately after it, so
         # the replica genuinely lands on a different node than the engine.
-        local VOLUME_ATTACH_DISK="${disks_ref[$VOLUME_ATTACH_NODE_INDEX]}"
-        local CROSSNODE_DISK="${disks_ref[$CROSSNODE_DISK_INDEX]}"
-        unset -n disks_ref
+        local VOLUME_ATTACH_DISK CROSSNODE_DISK
+        eval "VOLUME_ATTACH_DISK=\${${DISKS_ARRAY}[\$VOLUME_ATTACH_NODE_INDEX]}"
+        eval "CROSSNODE_DISK=\${${DISKS_ARRAY}[\$CROSSNODE_DISK_INDEX]}"
 
         for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
             log_run "Benchmarking v2 1-replica ${BDEV_TYPE}-bdev volume with CPU mask ${CPU_MASK}..."
@@ -293,13 +293,12 @@ function run_shard_benchmarks() {
             AIO)  DISKS_ARRAY="SHARD_AIO_BDEV_DISKS" ;;
         esac
 
-        local -n disks_ref="$DISKS_ARRAY"
-        if [[ ${#disks_ref[@]} -eq 0 ]]; then
+        local disks_count
+        eval "disks_count=\${#${DISKS_ARRAY}[@]}"
+        if [[ "$disks_count" -eq 0 ]]; then
             log_info "Skipping shard ${BDEV_TYPE} bdev (${DISKS_ARRAY} is empty)."
-            unset -n disks_ref
             continue
         fi
-        unset -n disks_ref
 
         for CPU_MASK in "${SHARD_CPU_MASKS[@]}"; do
             for SCHEME in "${SHARD_DATA_PARITY_CHUNKS[@]}"; do
