@@ -103,7 +103,7 @@ FALLBACK_PALETTE = [
 ]
 
 V2_LABEL_RE = re.compile(
-    r"^v2 volume \(.*?(NVMe|AIO) bdev.*?(\d+)\s+CPU core", re.IGNORECASE
+    r"^(?:v2|shard) volume \(.*?(NVMe|AIO) bdev.*?(\d+)\s+CPU core", re.IGNORECASE
 )
 
 

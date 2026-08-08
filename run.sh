@@ -46,7 +46,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [-c|--config <path>] {reset|run|report}"
+            echo "Usage: $0 [-c|--config <path>] {setup|reset|run|report}"
+            echo "  setup  Create .venv and install report deps (matplotlib/weasyprint)."
             echo "  run    Benchmark engines listed in <config>.dataEngines"
             echo "         (any subset of {v1, v2, shard})."
             echo "  Config precedence: --config flag > CONFIG_FILE env > ${SCRIPT_DIR}/config.json"
@@ -310,11 +311,47 @@ RESULTS_LOG_DIR="${RESULTS_DIR}/logs"
 REPORT_HTML="${RESULTS_DIR}/report.html"
 REPORT_PDF="${RESULTS_DIR}/report.pdf"
 
+# ---------------------------------------------------------------------------
+# Python interpreter used to write results.csv and render the report
+# (lib/fio.sh). Prefer the project-local virtualenv created by
+# `./run.sh setup` so the optional report deps (matplotlib/weasyprint) are
+# picked up even when the venv isn't activated. macOS ships an
+# externally-managed Python (PEP 668) that rejects a plain `pip install`, so
+# a venv is the path of least resistance there. Falls back to system python3.
+# ---------------------------------------------------------------------------
+VENV_DIR="${SCRIPT_DIR}/.venv"
+if [[ -x "${VENV_DIR}/bin/python" ]]; then
+    PYTHON_BIN="${VENV_DIR}/bin/python"
+else
+    PYTHON_BIN="python3"
+fi
+
 # Canonical replica-mode labels shared by lib/benchmarks.sh and the report
 # generator (order here is also the column order in the generated report).
 MODE_1_REPLICA="1 replica"
 MODE_1_REPLICA_CROSSNODE="1 cross-node replica"
 MODE_3_REPLICAS="3 replicas"
+
+# setup_python_env - create ${VENV_DIR} (if missing) and install the optional
+# report dependencies from requirements.txt into it. Idempotent; safe to
+# re-run. Enables PDF (weasyprint) and nicer charts (matplotlib) without
+# touching the system Python.
+setup_python_env() {
+    local req="${SCRIPT_DIR}/requirements.txt"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "❌ python3 is required to set up the report environment." >&2
+        exit 1
+    fi
+    if [[ ! -d "$VENV_DIR" ]]; then
+        echo "⚙️  Creating virtualenv at ${VENV_DIR}..."
+        python3 -m venv "$VENV_DIR" || { echo "❌ Failed to create virtualenv." >&2; exit 1; }
+    fi
+    echo "⚙️  Installing report dependencies from ${req}..."
+    "${VENV_DIR}/bin/python" -m pip install --upgrade pip >/dev/null
+    "${VENV_DIR}/bin/python" -m pip install -r "$req" \
+        || { echo "❌ Failed to install ${req}." >&2; exit 1; }
+    echo "✅ Report environment ready. run.sh will use ${VENV_DIR}/bin/python automatically."
+}
 
 # ============ Main Logic ============
 #
@@ -326,6 +363,9 @@ MODE_3_REPLICAS="3 replicas"
 
 main() {
     case "$1" in
+        setup)
+            setup_python_env
+            ;;
         reset)
             reset
             ;;
@@ -340,7 +380,8 @@ main() {
             generate_report
             ;;
         *)
-            echo "Usage: $0 [-c|--config <path>] {reset|run|report}" >&2
+            echo "Usage: $0 [-c|--config <path>] {setup|reset|run|report}" >&2
+            echo "  setup  Create .venv and install report deps (matplotlib/weasyprint)." >&2
             echo "  run    Benchmark engines listed in ${CONFIG_FILE}'s 'dataEngines'." >&2
             exit 1
             ;;

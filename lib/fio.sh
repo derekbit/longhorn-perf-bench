@@ -178,7 +178,7 @@ function record_result() {
 
     mkdir -p "$(dirname "$RESULTS_CSV")"
 
-    python3 - "$RESULTS_CSV" "$ACCESS_MODE" "$LABEL" "$MODE" \
+    "${PYTHON_BIN:-python3}" - "$RESULTS_CSV" "$ACCESS_MODE" "$LABEL" "$MODE" \
         "$RR_IOPS" "$RW_IOPS" "$SR_KIBPS" "$SW_KIBPS" "$RR_LAT" "$RW_LAT" <<'PY' \
         || die "Failed to record result into $RESULTS_CSV."
 import csv
@@ -311,6 +311,6 @@ function generate_report() {
     if [[ -n "$longhorn_version" ]]; then
         args+=(--longhorn-version "$longhorn_version")
     fi
-    python3 "${SCRIPT_DIR}/generate_report.py" "${args[@]}" \
+    "${PYTHON_BIN:-python3}" "${SCRIPT_DIR}/generate_report.py" "${args[@]}" \
         || die "Failed to generate report."
 }
