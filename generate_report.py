@@ -15,6 +15,7 @@ import argparse
 import csv
 import html
 import io
+import math
 import os
 import re
 from collections import OrderedDict
@@ -91,10 +92,22 @@ TABLE_GROUPS = [
 COLOR_BASELINE = "#f39c12"   # orange
 COLOR_V1       = "#e74c3c"   # red
 
-# Ordered shades from light to dark, used to color v2 series by CPU-core count
-# within each bdev-type group. Matches the visual style of the example report.
-GREEN_SHADES = ["#c8e6c9", "#81c784", "#4caf50", "#2e7d32", "#1b5e20"]
-BLUE_SHADES  = ["#bbdefb", "#64b5f6", "#2196f3", "#1565c0", "#0d47a1"]
+# Ordered shades from light to dark; each (bdev, IO mode) group gets its own
+# family, with entries shaded light -> dark in report order.
+GREEN_SHADES  = ["#c8e6c9", "#81c784", "#4caf50", "#2e7d32", "#1b5e20"]
+BLUE_SHADES   = ["#bbdefb", "#64b5f6", "#2196f3", "#1565c0", "#0d47a1"]
+PURPLE_SHADES = ["#e1bee7", "#ba68c8", "#9c27b0", "#6a1b9a", "#4a148c"]
+BROWN_SHADES  = ["#d7ccc8", "#a1887f", "#795548", "#5d4037", "#3e2723"]
+
+V2_SHADES = {
+    ("NVMe", "Poll"):      GREEN_SHADES,
+    ("AIO", "Poll"):       BLUE_SHADES,
+    ("NVMe", "Interrupt"): BROWN_SHADES,
+    ("AIO", "Interrupt"):  PURPLE_SHADES,
+}
+
+IO_MODE_ORDER = ["Poll", "Interrupt"]
+BDEV_ORDER = ["NVMe", "AIO"]
 
 # Fallback cycled palette for anything unrecognized.
 FALLBACK_PALETTE = [
@@ -103,7 +116,7 @@ FALLBACK_PALETTE = [
 ]
 
 V2_LABEL_RE = re.compile(
-    r"^(?:v2|shard) volume \(.*?(NVMe|AIO) bdev.*?(\d+)\s+CPU core", re.IGNORECASE
+    r"^(?:v2|shard) volume \(.*?(NVMe|AIO) bdev(?:.*?\b(Poll|Interrupt)\b)?.*?(\d+)\s+CPU core"
 )
 
 
@@ -183,6 +196,7 @@ def load_results(csv_path):
         ordered = [m for m in CANONICAL_MODES if m in section["modes"]]
         ordered += [m for m in section["modes"] if m not in ordered]
         section["modes"] = ordered
+        section["labels"].sort(key=label_sort_key)
 
     ordered_access_modes = [am for am in CANONICAL_ACCESS_MODES if am in sections]
     ordered_access_modes += [am for am in sections if am not in ordered_access_modes]
@@ -200,57 +214,74 @@ def scaled_value(raw, label, mode, csv_field, scale):
 
 
 def parse_v2(label):
-    """Return (bdev_type, cores) if label is a recognizable v2 label, else None."""
+    """Return (bdev_type, io_mode, cores) if label is a recognizable v2 label, else None."""
     m = V2_LABEL_RE.match(label)
     if not m:
         return None
-    return m.group(1), int(m.group(2))
+    return m.group(1), m.group(2) or "Poll", int(m.group(3))
 
 
-def pick_shade(shades, cores, all_cores):
-    """Pick a shade from `shades` (light->dark) based on the position of
-    `cores` within the sorted set of `all_cores` seen for this bdev type.
+def label_sort_key(label):
+    """v1 -> baseline -> v2 -> shard -> others; v2/shard ordered by IO mode,
+    bdev, then CPU cores. Unknown labels keep their CSV order (stable sort)."""
+    low = label.strip().lower()
+    if low.startswith("v1 volume"):
+        return (0,)
+    if "baseline" in low:
+        return (1,)
+    parsed = parse_v2(label)
+    if parsed:
+        bdev, io_mode, cores = parsed
+        kind = 2 if low.startswith("v2") else 3
+        return (kind, IO_MODE_ORDER.index(io_mode), BDEV_ORDER.index(bdev), cores)
+    return (4,)
 
-    - Smallest core count -> lightest shade, largest -> darkest.
-    - When only one series exists in the group, a medium shade is used so it
-      reads clearly on white and visually matches the other color families
-      (v1 red, baseline orange).
-    """
-    ordered = sorted(set(all_cores))
-    n = len(ordered)
-    if n == 0:
-        return shades[len(shades) // 2]
-    idx = ordered.index(cores)
-    if n == 1:
-        return shades[len(shades) // 2]
-    # Spread indices evenly across the palette.
-    slot = int(round(idx * (len(shades) - 1) / (n - 1)))
-    return shades[max(0, min(len(shades) - 1, slot))]
+
+def _mix(c1, c2, t):
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def gradient_light_to_dark(shades, n):
+    """Return n light -> dark colors from `shades` (given light -> dark),
+    starting halfway between shades[0] and shades[1] and stepping at most
+    0.75 stop per entry so neighbouring entries in a group stay close in tone."""
+    start = 0.5
+    step = min(0.75, (len(shades) - 1.5 - start) / max(n - 1, 1))
+    out = []
+    for i in range(n):
+        pos = start + i * step
+        lo = int(pos)
+        hi = min(lo + 1, len(shades) - 1)
+        out.append(_mix(shades[lo], shades[hi], pos - lo))
+    return out
 
 
 def assign_colors(labels):
-    """Assign a color per label: v1 -> red, baseline -> orange, v2 NVMe -> greens
-    (light-to-dark by CPU cores), v2 AIO -> blues, others -> cycled palette."""
-    v2_by_bdev = {"NVMe": [], "AIO": []}
+    """Assign a color per label: v1 -> red, baseline -> orange, each v2/shard
+    (bdev, IO mode) group -> its own color family shaded light -> dark in
+    `labels` order, others -> cycled palette."""
+    v2_by_group = OrderedDict()
     for label in labels:
         parsed = parse_v2(label)
         if parsed:
-            v2_by_bdev[parsed[0]].append(parsed[1])
+            v2_by_group.setdefault(parsed[:2], []).append(label)
 
     colors = {}
+    for group, group_labels in v2_by_group.items():
+        for label, color in zip(group_labels, gradient_light_to_dark(V2_SHADES[group], len(group_labels))):
+            colors[label] = color
+
     fallback_idx = 0
     for label in labels:
+        if label in colors:
+            continue
         if "baseline" in label.lower():
             colors[label] = COLOR_BASELINE
             continue
         if label.strip().lower().startswith("v1 volume"):
             colors[label] = COLOR_V1
-            continue
-        parsed = parse_v2(label)
-        if parsed:
-            bdev, cores = parsed
-            shades = GREEN_SHADES if bdev == "NVMe" else BLUE_SHADES
-            colors[label] = pick_shade(shades, cores, v2_by_bdev[bdev])
             continue
         colors[label] = FALLBACK_PALETTE[fallback_idx % len(FALLBACK_PALETTE)]
         fallback_idx += 1
@@ -293,7 +324,8 @@ def build_bar_chart_mpl(title, unit, labels, modes, colors, values_by_label_mode
     ax.set_ylabel(unit)
     ax.set_xticks(x)
     ax.set_xticklabels(modes)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}" if abs(v) >= 10 else f"{v:.1f}"))
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=6, integer=True, steps=[1, 2, 5, 10]))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -305,6 +337,15 @@ def build_bar_chart_mpl(title, unit, labels, modes, colors, values_by_label_mode
 
     svg = buf.getvalue()
     return svg[svg.index("<svg"):]
+
+
+def nice_axis(max_val, target_ticks=5):
+    """Return (axis_max, step) with an integer 1/2/5 x 10^k step covering max_val."""
+    raw = max_val / target_ticks
+    mag = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    step = max(1, int(round(step)))
+    return step * math.ceil(max_val / step), step
 
 
 def build_bar_chart_svg(title, unit, labels, modes, colors, values_by_label_mode):
@@ -320,6 +361,7 @@ def build_bar_chart_svg(title, unit, labels, modes, colors, values_by_label_mode
     max_val = max(values) if values else 1
     if max_val <= 0:
         max_val = 1
+    max_val, tick_step = nice_axis(max_val)
 
     n_modes = max(len(modes), 1)
     n_labels = max(len(labels), 1)
@@ -335,9 +377,9 @@ def build_bar_chart_svg(title, unit, labels, modes, colors, values_by_label_mode
         f'font-weight="bold">{html.escape(title)} ({html.escape(unit)})</text>'
     )
 
-    ticks = 5
+    ticks = int(max_val // tick_step)
     for i in range(ticks + 1):
-        val = max_val * i / ticks
+        val = tick_step * i
         y = margin_top + plot_h - (plot_h * i / ticks)
         parts.append(
             f'<line x1="{margin_left}" y1="{y:.1f}" x2="{margin_left + plot_w}" y2="{y:.1f}" '
@@ -345,7 +387,7 @@ def build_bar_chart_svg(title, unit, labels, modes, colors, values_by_label_mode
         )
         parts.append(
             f'<text x="{margin_left - 8}" y="{y + 4:.1f}" text-anchor="end" '
-            f'font-size="11" fill="#555">{fmt_number(val)}</text>'
+            f'font-size="11" fill="#555">{val:,}</text>'
         )
 
     parts.append(

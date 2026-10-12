@@ -1,22 +1,27 @@
 {
-  "nodes": ["dereksu-bench-1", "dereksu-bench-2", "dereksu-bench-3"],
+  "nodes": ["inst-h25mf-dereksu-bench", "inst-lqvyc-dereksu-bench", "inst-xxfgn-dereksu-bench"],
 
   "fioAccessModes": ["ReadWriteOnce", "ReadWriteMany"],
   "fioNodeIndex": 2,
+  "fioSize": "3G",
   "shareManagerPodNodeIndex": 0,
 
   "runBaseline": false,
 
-  "dataEngines": ["shard"],
+  "dataEngines": ["v1", "v2"],
 
   "v1": {
     "filesystemDisks": ["/mnt/disk", "/mnt/disk", "/mnt/disk"]
   },
 
   "v2": {
-    "nvmeBdevDisks": ["0000:00:0b.0", "0000:00:0b.0", "0000:00:0b.0"],
+    "nvmeBdevDisks": ["0000:00:0c.0", "0000:00:0c.0", "0000:00:0c.0"],
     "aioBdevDisks":  ["/dev/nvme3n1", "/dev/nvme3n1", "/dev/nvme3n1"],
-    "cpuMasks": ["0x1", "0x3", "0xF", "0xFF", "0xFFFF"]
+    "cpuMasks": ["0x1", "0x3", "0xF", "0xFF", "0xFFFF"],
+    "ioModes": {
+      "Poll":      ["nvmeBdevDisks", "aioBdevDisks"],
+      "Interrupt": ["aioBdevDisks"]
+    }
   },
 
   "shard": {

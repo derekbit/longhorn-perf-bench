@@ -4,7 +4,7 @@
 # the results CSV consumed by generate_report.py.
 #
 # Requires lib/log.sh to be sourced first, and the following globals to be
-# set by run.sh: FIO_YAML, FIO_YAML_URL, FIO_JOB_NAME, FIO_ACCESS_MODE,
+# set by run.sh: FIO_YAML, FIO_YAML_URL, FIO_JOB_NAME, FIO_ACCESS_MODE, FIO_SIZE,
 # RESULTS_CSV, RESULTS_LOG_DIR.
 
 # download_fio_yaml - fetch the upstream longhorn/kbench fio.yaml into
@@ -52,6 +52,20 @@ function set_fio_pvc_access_mode() {
     ' "$FIO_YAML" || die "Failed to patch fio.yaml with accessModes."
 }
 
+# set_fio_size <size> - sets the fio test-file SIZE env (e.g. "30G") and sizes
+# the PVC 10% larger (rounded up, e.g. "33Gi") to leave room for filesystem overhead.
+function set_fio_size() {
+    local FIO_SIZE="$1"
+    local NUM="${FIO_SIZE%[KMGT]}" UNIT="${FIO_SIZE: -1}"
+    local PVC_SIZE="$(( (NUM * 11 + 9) / 10 ))${UNIT}i"
+    export FIO_SIZE PVC_SIZE
+    yq -i '
+      ( select(.kind == "Job") | .spec.template.spec.containers[0].env[] | select(.name == "SIZE") | .value ) = strenv(FIO_SIZE)
+      | ( select(.kind == "PersistentVolumeClaim") | .spec.resources.requests.storage ) = strenv(PVC_SIZE)
+      | .
+    ' "$FIO_YAML" || die "Failed to patch fio.yaml with SIZE=${FIO_SIZE} / PVC ${PVC_SIZE}."
+}
+
 # Uses nodeSelector rather than pinning spec.template.spec.nodeName directly.
 # Setting nodeName bypasses the Kubernetes scheduler entirely, which also
 # skips the scheduler's volume-binding step - so StorageClasses with
@@ -73,8 +87,14 @@ function set_fio_running_node() {
 function wait_for_fio_pods_completed() {
     log_wait "Waiting for fio pods to be completed..."
 
-    local PODS
-    PODS=$(kubectl get pods -l "job-name=${FIO_JOB_NAME}" -o jsonpath="{.items[*].metadata.name}")
+    local PODS=""
+    # The Job controller may not have created the pod yet right after `kubectl apply`.
+    local attempt
+    for ((attempt = 1; attempt <= RETRY_COUNT; attempt++)); do
+        PODS=$(kubectl get pods -l "job-name=${FIO_JOB_NAME}" -o jsonpath="{.items[*].metadata.name}")
+        [[ -n "$PODS" ]] && break
+        sleep "$RETRY_INTERVAL"
+    done
 
     if [[ -z "$PODS" ]]; then
         log_error "No fio pods found for job '${FIO_JOB_NAME}'."
@@ -83,10 +103,29 @@ function wait_for_fio_pods_completed() {
 
     for POD in $PODS; do
         log_wait "Waiting for fio pod ${POD} to be completed..."
+        local FAULTED_CHECKS=0
         while true; do
             local PHASE
             PHASE=$(kubectl get pod "$POD" -o jsonpath='{.status.phase}')
             [[ "$PHASE" == "Succeeded" || "$PHASE" == "Failed" ]] && break
+
+            # Otherwise a faulted volume leaves the pod in ContainerCreating forever.
+            if [[ "$PHASE" == "Pending" ]]; then
+                local PV ROBUSTNESS
+                PV=$(kubectl get pvc "$FIO_PVC_NAME" -o jsonpath='{.spec.volumeName}' 2>/dev/null)
+                ROBUSTNESS=""
+                [[ -n "$PV" ]] && ROBUSTNESS=$(kubectl -n longhorn-system get volumes.longhorn.io "$PV" \
+                    -o jsonpath='{.status.robustness}' 2>/dev/null)
+                if [[ "$ROBUSTNESS" == "faulted" ]]; then
+                    FAULTED_CHECKS=$((FAULTED_CHECKS + 1))
+                    if (( FAULTED_CHECKS >= 12 )); then
+                        log_error "Longhorn volume ${PV} has been faulted for 60s; fio pod ${POD} cannot start."
+                        return 1
+                    fi
+                else
+                    FAULTED_CHECKS=0
+                fi
+            fi
             sleep 5
         done
     done
@@ -103,7 +142,7 @@ function terminate_fio_pods() {
         kubectl delete -f "$FIO_YAML" --ignore-not-found
     else
         kubectl delete job "$FIO_JOB_NAME" --ignore-not-found
-        kubectl delete pvc -l "job-name=${FIO_JOB_NAME}" --ignore-not-found
+        kubectl delete pvc "$FIO_PVC_NAME" --ignore-not-found
     fi
 
     local ELAPSED=0
@@ -120,6 +159,23 @@ function terminate_fio_pods() {
     done
 
     log_warn "Timeout waiting for fio pods to terminate."
+}
+
+function fio_pvc_is_gone() {
+    [[ -z "$(kubectl get pvc "$FIO_PVC_NAME" --ignore-not-found -o name)" ]]
+}
+
+# cleanup_fio_resources - delete the fio Job, its pods and the test PVC, then
+# wait until the PVC (and therefore its backing volume) is gone.
+function cleanup_fio_resources() {
+    terminate_fio_pods
+    kubectl delete pods -l "job-name=${FIO_JOB_NAME}" --ignore-not-found --wait=false
+    kubectl delete pvc "$FIO_PVC_NAME" --ignore-not-found --wait=false
+
+    log_wait "Waiting for PVC '${FIO_PVC_NAME}' to be deleted..."
+    poll_until "$RETRY_COUNT" "$RETRY_INTERVAL" "PVC '${FIO_PVC_NAME}' deleted" fio_pvc_is_gone \
+        || return 1
+    log_ok "fio pods and PVC '${FIO_PVC_NAME}' have been cleaned up."
 }
 
 # parse_fio_summary <log_text>
@@ -242,7 +298,10 @@ function run_fio() {
 
     set_fio_pvc_storage_class "$STORAGE_CLASS"
     set_fio_pvc_access_mode "$PVC_ACCESS_MODE"
+    set_fio_size "$FIO_SIZE"
     set_fio_running_node "$NODE"
+
+    wait_for_all_node_disks_ready || die "Longhorn node disks are not all Ready; refusing to create the fio PVC/pod."
 
     kubectl apply -f "$FIO_YAML" || die "Failed to apply fio.yaml."
 
@@ -256,7 +315,7 @@ function run_fio() {
 
     mkdir -p "$RESULTS_LOG_DIR"
     local SLUG
-    SLUG=$(echo "${LABEL}_${MODE}" | tr -cs '[:alnum:]' '_')
+    SLUG=$(echo "${FIO_ACCESS_MODE}_${LABEL}_${MODE}" | tr -cs '[:alnum:]' '_')
     echo "$LOG" > "${RESULTS_LOG_DIR}/${SLUG}.log"
 
     local RAND_READ_IOPS RAND_WRITE_IOPS SEQ_READ_KIBPS SEQ_WRITE_KIBPS RAND_READ_LAT_NS RAND_WRITE_LAT_NS

@@ -6,6 +6,7 @@ set -o pipefail
 #
 # Usage:
 #   ./run.sh [-c|--config <path>] reset             Reset the cluster to its default state.
+#   ./run.sh [-c|--config <path>] cleanup           Delete the fio test Job/pods and PVC.
 #   ./run.sh [-c|--config <path>] run                Benchmark whichever engines are listed in
 #                                                    config.json's `dataEngines` (any subset of
 #                                                    {v1, v2, shard}).
@@ -46,10 +47,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [-c|--config <path>] {setup|reset|run|report}"
-            echo "  setup  Create .venv and install report deps (matplotlib/weasyprint)."
-            echo "  run    Benchmark engines listed in <config>.dataEngines"
-            echo "         (any subset of {v1, v2, shard})."
+            echo "Usage: $0 [-c|--config <path>] {setup|reset|cleanup|run|report}"
+            echo "  setup    Create .venv and install report deps (matplotlib/weasyprint)."
+            echo "  cleanup  Delete the fio test Job/pods and PVC."
+            echo "  run      Benchmark engines listed in <config>.dataEngines"
+            echo "           (any subset of {v1, v2, shard})."
             echo "  Config precedence: --config flag > CONFIG_FILE env > ${SCRIPT_DIR}/config.json"
             exit 0
             ;;
@@ -94,6 +96,7 @@ source "${SCRIPT_DIR}/lib/benchmarks.sh"
 #     nodes                      -> NODES                          (string array)
 #     fioAccessModes             -> FIO_ACCESS_MODES               (string array)
 #     fioNodeIndex               -> FIO_NODE_INDEX                 (integer)
+#     fioSize                    -> FIO_SIZE                       (fio SIZE, e.g. "30G"; default "30G")
 #     shareManagerPodNodeIndex   -> SHARE_MANAGER_POD_NODE_INDEX   (integer)
 #     runBaseline                -> RUN_BASELINE                   (bool)
 #     dataEngines                -> DATA_ENGINES                   (subset of {v1, v2, shard})
@@ -102,7 +105,8 @@ source "${SCRIPT_DIR}/lib/benchmarks.sh"
 #
 #   v2: { nvmeBdevDisks,         -> V2_NVME_BDEV_DISKS             (string array, per-node)
 #         aioBdevDisks,          -> V2_AIO_BDEV_DISKS              (string array, per-node)
-#         cpuMasks }             -> V2_CPU_MASKS                   (string array)
+#         cpuMasks,              -> V2_CPU_MASKS                   (string array)
+#         ioModes }              -> V2_IO_MODES / V2_IO_MODE_DISKS ({"Poll"|"Interrupt": ["nvmeBdevDisks"|"aioBdevDisks", ...]})
 #
 #   shard: { nvmeBdevDisks,      -> SHARD_NVME_BDEV_DISKS          (string array, per-node)
 #            aioBdevDisks,       -> SHARD_AIO_BDEV_DISKS           (string array, per-node)
@@ -186,6 +190,9 @@ read_array FIO_ACCESS_MODES   < <(_cfg_array '.fioAccessModes')
 #           pod's node under RWX - not the fio pod's node.
 FIO_NODE_INDEX=$(_cfg_scalar '.fioNodeIndex')
 
+# fio test-file size (<integer><K|M|G|T>). The PVC is auto-sized 10% larger.
+FIO_SIZE=$(_cfg_scalar '.fioSize // "30G"')
+
 # Which NODES[] entry runs each Longhorn StorageClass's share-manager
 # (parameters.shareManagerNodeSelector). Only relevant when FIO_ACCESS_MODE
 # is "ReadWriteMany". Independent of FIO_NODE_INDEX.
@@ -217,6 +224,18 @@ read_array FILESYSTEM_DISKS   < <(_cfg_array '.v1.filesystemDisks')
 read_array V2_NVME_BDEV_DISKS < <(_cfg_array '.v2.nvmeBdevDisks')   # BDF format, e.g. "0000:00:0b.0"
 read_array V2_AIO_BDEV_DISKS  < <(_cfg_array '.v2.aioBdevDisks')    # block device path, e.g. "/dev/nvme3n1"
 read_array V2_CPU_MASKS       < <(_cfg_array '.v2.cpuMasks')
+# v2.ioModes maps each I/O mode to the disk arrays it runs on, e.g.
+#   {"Poll": ["nvmeBdevDisks", "aioBdevDisks"], "Interrupt": ["aioBdevDisks"]}
+# "Interrupt" sets data-engine-interrupt-mode-enabled=true; "Poll" sets it to false.
+# V2_IO_MODE_DISKS[i] holds the space-joined disk keys for V2_IO_MODES[i].
+_V2_IO_MODES_JQ='(.v2.ioModes // {"Poll": ["nvmeBdevDisks", "aioBdevDisks"]})'
+if ! jq -e "${_V2_IO_MODES_JQ} | type == \"object\"" "$CONFIG_FILE" >/dev/null; then
+    echo "❌ v2.ioModes must be an object, e.g. {\"Poll\": [\"nvmeBdevDisks\", \"aioBdevDisks\"], \"Interrupt\": [\"aioBdevDisks\"]}." >&2
+    exit 1
+fi
+read_array V2_IO_MODES      < <(jq -r "${_V2_IO_MODES_JQ} | keys_unsorted[]" "$CONFIG_FILE")
+read_array V2_IO_MODE_DISKS < <(jq -r "${_V2_IO_MODES_JQ} | .[] | join(\" \")" "$CONFIG_FILE")
+unset _V2_IO_MODES_JQ
 
 # -- shard (v2 erasure-coded volumes) --------------------------------------
 # Same shape as v2, plus the erasure-coding matrix.
@@ -267,6 +286,27 @@ for _DE in "${DATA_ENGINES[@]}"; do
 done
 unset _DE
 
+if [[ ! "$FIO_SIZE" =~ ^[1-9][0-9]*[KMGT]$ ]]; then
+    echo "❌ fioSize '${FIO_SIZE}' is invalid (expected <integer><K|M|G|T>, e.g. \"30G\")." >&2
+    exit 1
+fi
+
+for _IM in "${V2_IO_MODES[@]}"; do
+    case "$_IM" in
+        Poll|Interrupt) ;;
+        *) echo "❌ Unsupported key '${_IM}' in v2.ioModes (allowed: Poll, Interrupt)." >&2; exit 1 ;;
+    esac
+done
+unset _IM
+
+for _DK in ${V2_IO_MODE_DISKS[@]}; do
+    case "$_DK" in
+        nvmeBdevDisks|aioBdevDisks) ;;
+        *) echo "❌ Unsupported entry '${_DK}' in v2.ioModes (allowed: nvmeBdevDisks, aioBdevDisks)." >&2; exit 1 ;;
+    esac
+done
+unset _DK
+
 # The "volume attach node" is where the Longhorn engine actually attaches:
 #   - RWO: the fio pod's node (engine attaches wherever the workload runs).
 #   - RWX (v1 share-manager): the share-manager pod's node (the engine
@@ -286,6 +326,8 @@ FIO_NODE="${NODES[$FIO_NODE_INDEX]}"
 POD_READY_TIMEOUT="300s"
 RETRY_COUNT=60
 RETRY_INTERVAL=5
+# Block disks may need SPDK blobstore recovery (several minutes on large NVMe) after an unclean shutdown.
+BLOCK_DISK_RETRY_COUNT=240
 INSTANCE_MANAGER_TIMEOUT=300
 INSTANCE_MANAGER_INTERVAL=5
 FIO_TERMINATE_TIMEOUT=60
@@ -303,6 +345,7 @@ FIO_YAML_URL="https://raw.githubusercontent.com/longhorn/kbench/refs/heads/main/
 TMP_DIR="${SCRIPT_DIR}/tmp"
 FIO_YAML="${TMP_DIR}/fio.yaml"
 FIO_JOB_NAME="kbench"
+FIO_PVC_NAME="kbench-pvc"
 
 RESULTS_DIR="${SCRIPT_DIR}/results"
 RESULTS_CSV="${RESULTS_DIR}/results.csv"
@@ -369,6 +412,9 @@ main() {
         reset)
             reset
             ;;
+        cleanup)
+            cleanup_fio_resources || exit 1
+            ;;
         run)
             if [[ -n "$2" ]]; then
                 echo "ℹ️  './run.sh run <engine>' is no longer accepted; edit 'dataEngines' in ${CONFIG_FILE} instead." >&2
@@ -380,9 +426,10 @@ main() {
             generate_report
             ;;
         *)
-            echo "Usage: $0 [-c|--config <path>] {setup|reset|run|report}" >&2
-            echo "  setup  Create .venv and install report deps (matplotlib/weasyprint)." >&2
-            echo "  run    Benchmark engines listed in ${CONFIG_FILE}'s 'dataEngines'." >&2
+            echo "Usage: $0 [-c|--config <path>] {setup|reset|cleanup|run|report}" >&2
+            echo "  setup    Create .venv and install report deps (matplotlib/weasyprint)." >&2
+            echo "  cleanup  Delete the fio test Job/pods and PVC." >&2
+            echo "  run      Benchmark engines listed in ${CONFIG_FILE}'s 'dataEngines'." >&2
             exit 1
             ;;
     esac

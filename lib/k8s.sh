@@ -99,9 +99,39 @@ function delete_shard_storageclass() {
 # Instance managers / data engines
 # ---------------------------------------------------------------------------
 
+# running_instance_managers_json [data_engine] - JSON array of InstanceManager
+# CRs in state "running", as {name, node, engine} objects.
+function running_instance_managers_json() {
+    kubectl -n longhorn-system get instancemanagers.longhorn.io -o json | jq -c --arg de "${1:-}" '
+      [.items[] | select(.status.currentState == "running" and ($de == "" or .spec.dataEngine == $de))
+       | {name: .metadata.name, node: .spec.nodeID, engine: .spec.dataEngine}]'
+}
+
+# instance_managers_running_on_all_nodes <data_engine> - check function for poll_until.
+function instance_managers_running_on_all_nodes() {
+    local DATA_ENGINE="$1" RUNNING NODES_JSON
+    RUNNING=$(running_instance_managers_json "$DATA_ENGINE") || return 1
+    NODES_JSON=$(printf '%s\n' "${NODES[@]}" | jq -R . | jq -sc .)
+    jq -e --argjson nodes "$NODES_JSON" '[.[].node] as $up | $nodes | all(. as $n | $up | index($n) != null)' \
+        <<< "$RUNNING" >/dev/null
+}
+
 function wait_for_instance_manager_ready() {
     local DATA_ENGINE="$1"
+
+    # Callers like update_data_engine_cpu_mask run while the engine is disabled.
+    if [[ "$(kubectl -n longhorn-system get setting.longhorn.io "${DATA_ENGINE}-data-engine" -o jsonpath='{.value}')" != "true" ]]; then
+        log_info "${DATA_ENGINE} data engine is disabled; not waiting for its instance managers."
+        return 0
+    fi
+
     log_wait "Waiting for ${DATA_ENGINE} data engine instance manager to be ready..."
+
+    # Pods may not exist yet right after enabling the engine, so first wait for
+    # a running InstanceManager on every node before checking pod readiness.
+    poll_until "$RETRY_COUNT" "$RETRY_INTERVAL" "${DATA_ENGINE} instance manager running on every node" \
+        instance_managers_running_on_all_nodes "$DATA_ENGINE" \
+        || die "${DATA_ENGINE} instance managers are not running on every node."
 
     local PODS
     PODS=$(kubectl -n longhorn-system get pods \
@@ -166,6 +196,19 @@ function update_data_engine_cpu_mask() {
     wait_for_instance_manager_ready v2
 }
 
+# update_data_engine_io_mode <Poll|Interrupt> - toggles
+# data-engine-interrupt-mode-enabled. Call while the v2 data engine is disabled.
+function update_data_engine_io_mode() {
+    local IO_MODE="$1" ENABLED
+    case "$IO_MODE" in
+        Poll)      ENABLED="false" ;;
+        Interrupt) ENABLED="true" ;;
+        *) log_error "Unsupported v2 I/O mode '${IO_MODE}' (expected Poll or Interrupt)."; return 1 ;;
+    esac
+    kubectl -n longhorn-system patch setting.longhorn.io data-engine-interrupt-mode-enabled --type=merge -p "{\"value\":\"${ENABLED}\"}" \
+        || die "Failed to set data-engine-interrupt-mode-enabled to ${ENABLED}."
+}
+
 # ---------------------------------------------------------------------------
 # Disk status helpers (shared by filesystem-disk and block-disk management)
 # ---------------------------------------------------------------------------
@@ -200,6 +243,45 @@ function disk_is_ready_and_schedulable() {
     [[ "$READY" == "True" && "$SCHEDULABLE" == "True" ]]
 }
 
+# node_disks_all_ready <node> [running_ims_json] - true when every disk in
+# .spec.disks is reported in .status.diskStatus, every diskStatus entry has
+# Ready=True and was reported by a currently running instance manager (so
+# stale status left over from a restarted instance manager is rejected), and
+# every disk with allowScheduling=true also has Schedulable=True (disabled
+# disks are intentionally unschedulable during some benchmarks).
+function node_disks_all_ready() {
+    local NODE="$1" RUNNING="${2:-}"
+    [[ -n "$RUNNING" ]] || RUNNING=$(running_instance_managers_json) || return 1
+    kubectl -n longhorn-system get node.longhorn.io "${NODE}" -o json | jq -e --argjson ims "$RUNNING" '
+      def cond($d; $t): (($d.conditions // []) | any(.type == $t and .status == "True"));
+      ([$ims[].name]) as $im_names
+      | (.status.diskStatus // {}) as $st
+      | ((.spec.disks // {}) | keys | all(. as $k | $st | has($k)))
+        and ($st | to_entries | all(cond(.value; "Ready")))
+        and ($st | to_entries | all(.value.instanceManagerName as $im | $im_names | index($im) != null))
+        and ((.spec.disks // {}) | to_entries
+             | map(select(.value.allowScheduling == true))
+             | all(cond($st[.key]; "Schedulable")))
+    ' >/dev/null
+}
+
+# all_node_disks_ready - node_disks_all_ready on every node in NODES, evaluated together.
+function all_node_disks_ready() {
+    local NODE RUNNING
+    RUNNING=$(running_instance_managers_json) || return 1
+    for NODE in "${NODES[@]}"; do
+        node_disks_all_ready "$NODE" "$RUNNING" || return 1
+    done
+}
+
+# wait_for_all_node_disks_ready - block until all_node_disks_ready holds.
+function wait_for_all_node_disks_ready() {
+    log_wait "Waiting for all Longhorn node disks to be Ready and Schedulable..."
+    poll_until "$BLOCK_DISK_RETRY_COUNT" "$RETRY_INTERVAL" "all Longhorn node disks Ready and Schedulable" \
+        all_node_disks_ready || return 1
+    log_ok "All Longhorn node disks are Ready and Schedulable."
+}
+
 # ---------------------------------------------------------------------------
 # Filesystem disks
 # ---------------------------------------------------------------------------
@@ -214,6 +296,7 @@ function add_filesystem_disks() {
         return 1
     fi
 
+    local i
     for i in "${!NODES[@]}"; do
         local NODE="${NODES[i]}"
         local DISK
@@ -364,6 +447,7 @@ function add_block_disks() {
         return 1
     fi
 
+    local i
     for i in "${!NODES[@]}"; do
         local NODE="${NODES[i]}"
         local DISK
@@ -406,7 +490,8 @@ EOF
             --type='json' -p="[{\"op\":\"add\",\"path\":\"/spec/disks/${DISK_NAME}\",\"value\":${DISK_CONFIG}}]" \
         || return 1
 
-    if poll_until "$RETRY_COUNT" "$RETRY_INTERVAL" "disk '${DISK_NAME}' ready and schedulable" \
+    log_wait "Waiting for block disk '${DISK_NAME}' on node '${NODE}' to be Ready and Schedulable (may take minutes if SPDK recovers the lvstore)..."
+    if poll_until "$BLOCK_DISK_RETRY_COUNT" "$RETRY_INTERVAL" "disk '${DISK_NAME}' ready and schedulable" \
         disk_is_ready_and_schedulable "$NODE" "$DISK_NAME"; then
         log_ok "Block disk '${DISK_NAME}' is Ready and Schedulable on node '${NODE}'."
         return 0
@@ -455,7 +540,7 @@ function delete_block_disks_on_node() {
     done
 
     log_wait "Waiting for Longhorn to reconcile node '${NODE}'..."
-    if poll_until "$RETRY_COUNT" "$RETRY_INTERVAL" "block disks removed from '${NODE}'" \
+    if poll_until "$BLOCK_DISK_RETRY_COUNT" "$RETRY_INTERVAL" "block disks removed from '${NODE}'" \
         no_block_disks_remain "$NODE"; then
         log_ok "All block disks have been successfully removed from node '${NODE}'!"
         return 0

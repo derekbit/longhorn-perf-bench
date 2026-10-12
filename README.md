@@ -10,6 +10,7 @@ configurable `k+m` matrix.
 
 ```sh
 ./run.sh reset           # Reset the cluster to its default state
+./run.sh cleanup         # Delete the fio test Job/pods and PVC (kbench-pvc)
 ./run.sh run             # Benchmark whichever engines are listed in
                          #   config.json's `dataEngines` (any subset of
                          #   {v1, v2, shard}).
@@ -44,6 +45,7 @@ engine skips that backend for that engine.
 | `nodes`                    | `string[]` | Cluster node names (must have ≥ 2 for cross-node tests).                                                    |
 | `fioAccessModes`           | `string[]` | PVC access modes exercised by the v1/v2 suite. Values: `"ReadWriteOnce"`, `"ReadWriteMany"`.               |
 | `fioNodeIndex`             | `integer` | Index into `nodes` for the fio workload pod.                                                                |
+| `fioSize`                  | `string`  | fio test-file `SIZE` (`<integer><K\|M\|G\|T>`, default `"30G"`). The PVC is auto-sized 10% larger (e.g. `30G` -> `33Gi`). |
 | `shareManagerPodNodeIndex` | `integer` | Index into `nodes` for each StorageClass's share-manager (RWX only).                                        |
 | `runBaseline`              | `bool`    | If `true`, also install local-path-provisioner and record it as a baseline (RWO-only, skipped under RWX).   |
 | `dataEngines`              | `string[]` | Which engine suites to run this session. Any subset of `["v1", "v2", "shard"]`.                             |
@@ -61,6 +63,7 @@ engine skips that backend for that engine.
 | `nvmeBdevDisks` | `string[]` | Per-node PCI BDF paths for the v2 NVMe bdev backend. `[]` to skip that backend.                     |
 | `aioBdevDisks`  | `string[]` | Per-node block-device paths for the v2 AIO bdev backend. `[]` to skip that backend.                 |
 | `cpuMasks`      | `string[]` | Hex CPU masks driven through the v2 data engine (e.g. `"0x1"`, `"0xFF"`).                           |
+| `ioModes`       | `object`   | Maps each I/O mode (`"Poll"` / `"Interrupt"`) to the disk arrays it runs on, e.g. `{"Poll": ["nvmeBdevDisks", "aioBdevDisks"], "Interrupt": ["aioBdevDisks"]}` (NVMe bdev doesn't support interrupt mode yet). Default `{"Poll": ["nvmeBdevDisks", "aioBdevDisks"]}`. `Interrupt` sets `data-engine-interrupt-mode-enabled=true`. |
 
 **`shard`** (v2 erasure-coded volumes)
 
@@ -101,7 +104,8 @@ v2 volumes are benchmarked against **both** SPDK bdev backends, driven by
   next, as AIO bdev. Labeled `v2 volume (NVMe-OF frontend, AIO bdev, ...)`.
 
 Set either array to `[]` to skip that backend. Each backend runs the full
-`v2.cpuMasks x {1 replica, 1 cross-node replica, 3 replicas}` matrix.
+`v2.ioModes x v2.cpuMasks x {1 replica, 1 cross-node replica, 3 replicas}`
+matrix. Shard volumes always run in Poll mode.
 
 v1 volumes use filesystem disks configured via `v1.filesystemDisks` in
 [`config.json`](config.json) (default `/mnt/disk` on every node). The suite

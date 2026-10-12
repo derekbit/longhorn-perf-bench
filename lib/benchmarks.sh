@@ -4,7 +4,8 @@
 #
 # Requires lib/log.sh, lib/k8s.sh and lib/fio.sh to be sourced first, and the
 # following globals to be set by run.sh: NODES, FILESYSTEM_DISKS,
-# V2_NVME_BDEV_DISKS, V2_AIO_BDEV_DISKS, V2_CPU_MASKS, SHARD_NVME_BDEV_DISKS,
+# V2_NVME_BDEV_DISKS, V2_AIO_BDEV_DISKS, V2_CPU_MASKS, V2_IO_MODES,
+# V2_IO_MODE_DISKS, SHARD_NVME_BDEV_DISKS,
 # SHARD_AIO_BDEV_DISKS, SHARD_CPU_MASKS, SHARD_DATA_PARITY_CHUNKS,
 # SHARD_STRIP_SIZE_KB, RUN_BASELINE, DATA_ENGINES, FIO_NODE, FIO_NODE_INDEX,
 # SHARE_MANAGER_POD_NODE, SHARE_MANAGER_POD_NODE_INDEX, FIO_ACCESS_MODES,
@@ -30,14 +31,14 @@ function cpu_mask_to_cores() {
     echo "$count"
 }
 
-# v2_label <bdev_type> <cpu_mask> - produces a canonical v2 volume label such
-# as: "v2 volume (NVMe-OF frontend, NVMe bdev, Poll, Hugepage, 4 CPU cores)".
+# v2_label <bdev_type> <cpu_mask> <io_mode> - produces a canonical v2 volume
+# label such as: "v2 volume (NVMe-OF frontend, NVMe bdev, Poll, Hugepage, 4 CPU cores)".
 function v2_label() {
-    local BDEV_TYPE="$1" CPU_MASK="$2"
+    local BDEV_TYPE="$1" CPU_MASK="$2" IO_MODE="$3"
     local CORES SUFFIX
     CORES=$(cpu_mask_to_cores "$CPU_MASK")
     if [[ "$CORES" -eq 1 ]]; then SUFFIX="CPU core"; else SUFFIX="CPU cores"; fi
-    echo "v2 volume (NVMe-OF frontend, ${BDEV_TYPE} bdev, Poll, Hugepage, ${CORES} ${SUFFIX})"
+    echo "v2 volume (NVMe-OF frontend, ${BDEV_TYPE} bdev, ${IO_MODE}, Hugepage, ${CORES} ${SUFFIX})"
 }
 
 function reset_environment() {
@@ -106,14 +107,15 @@ function benchmark_v1_r1_crossnode_volume() {
 }
 
 function benchmark_v2_r3_volume() {
-    local CPU_MASK="$1" BDEV_TYPE="$2" DISKS_ARRAY="$3"
+    local CPU_MASK="$1" BDEV_TYPE="$2" DISKS_ARRAY="$3" IO_MODE="$4"
     local LABEL
-    LABEL=$(v2_label "$BDEV_TYPE" "$CPU_MASK")
+    LABEL=$(v2_label "$BDEV_TYPE" "$CPU_MASK" "$IO_MODE")
 
     reset_environment
 
     disable_data_engine "v2" || exit 1
     update_data_engine_cpu_mask "$CPU_MASK" || exit 1
+    update_data_engine_io_mode "$IO_MODE" || exit 1
 
     enable_data_engine "v2" || exit 1
     add_block_disks "$DISKS_ARRAY" || exit 1
@@ -122,14 +124,15 @@ function benchmark_v2_r3_volume() {
 }
 
 function benchmark_v2_r1_volume() {
-    local CPU_MASK="$1" BDEV_TYPE="$2" DISK_PATH="$3"
+    local CPU_MASK="$1" BDEV_TYPE="$2" DISK_PATH="$3" IO_MODE="$4"
     local LABEL
-    LABEL=$(v2_label "$BDEV_TYPE" "$CPU_MASK")
+    LABEL=$(v2_label "$BDEV_TYPE" "$CPU_MASK" "$IO_MODE")
 
     reset_environment
 
     disable_data_engine "v2" || exit 1
     update_data_engine_cpu_mask "$CPU_MASK" || exit 1
+    update_data_engine_io_mode "$IO_MODE" || exit 1
 
     enable_data_engine "v2" || exit 1
     # Place the single replica on VOLUME_ATTACH_NODE (where the engine
@@ -141,14 +144,15 @@ function benchmark_v2_r1_volume() {
 }
 
 function benchmark_v2_r1_crossnode_volume() {
-    local CPU_MASK="$1" BDEV_TYPE="$2" DISK_PATH="$3"
+    local CPU_MASK="$1" BDEV_TYPE="$2" DISK_PATH="$3" IO_MODE="$4"
     local LABEL
-    LABEL=$(v2_label "$BDEV_TYPE" "$CPU_MASK")
+    LABEL=$(v2_label "$BDEV_TYPE" "$CPU_MASK" "$IO_MODE")
 
     reset_environment
 
     disable_data_engine "v2" || exit 1
     update_data_engine_cpu_mask "$CPU_MASK" || exit 1
+    update_data_engine_io_mode "$IO_MODE" || exit 1
 
     enable_data_engine "v2" || exit 1
     add_block_disk_on_node "$CROSSNODE_NODE" "$DISK_PATH" || exit 1
@@ -175,43 +179,52 @@ function run_v1_benchmarks() {
 }
 
 function run_v2_benchmarks() {
-    # Order matters: NVMe bdev (BDF paths) first, then AIO bdev (/dev/* paths),
-    # so the CSV rows and the final report end up ordered NVMe -> AIO within
-    # the v2 section.
-    local BDEV_TYPE DISKS_ARRAY
-    for BDEV_TYPE in NVMe AIO; do
-        case "$BDEV_TYPE" in
-            NVMe) DISKS_ARRAY="V2_NVME_BDEV_DISKS" ;;
-            AIO)  DISKS_ARRAY="V2_AIO_BDEV_DISKS" ;;
-        esac
+    # Order matters: IO mode (v2.ioModes key order) outermost, then NVMe bdev
+    # (BDF paths) before AIO bdev (/dev/* paths), so the CSV rows and the
+    # final report follow the same order within the v2 section.
+    local IO_IDX IO_MODE IO_MODE_DISKS DISK_KEY BDEV_TYPE DISKS_ARRAY
+    for IO_IDX in "${!V2_IO_MODES[@]}"; do
+        IO_MODE="${V2_IO_MODES[IO_IDX]}"
+        IO_MODE_DISKS="${V2_IO_MODE_DISKS[IO_IDX]}"
+        for DISK_KEY in nvmeBdevDisks aioBdevDisks; do
+            case "$DISK_KEY" in
+                nvmeBdevDisks) BDEV_TYPE="NVMe"; DISKS_ARRAY="V2_NVME_BDEV_DISKS" ;;
+                aioBdevDisks)  BDEV_TYPE="AIO";  DISKS_ARRAY="V2_AIO_BDEV_DISKS" ;;
+            esac
 
-        local disks_count
-        eval "disks_count=\${#${DISKS_ARRAY}[@]}"
-        if [[ "$disks_count" -eq 0 ]]; then
-            log_info "Skipping ${BDEV_TYPE} bdev (${DISKS_ARRAY} is empty)."
-            continue
-        fi
-        # VOLUME_ATTACH_DISK is the disk on the node where the engine
-        # attaches (VOLUME_ATTACH_NODE) - used for the co-located 1-replica
-        # benchmark. CROSSNODE_DISK is on the node immediately after it, so
-        # the replica genuinely lands on a different node than the engine.
-        local VOLUME_ATTACH_DISK CROSSNODE_DISK
-        eval "VOLUME_ATTACH_DISK=\${${DISKS_ARRAY}[\$VOLUME_ATTACH_NODE_INDEX]}"
-        eval "CROSSNODE_DISK=\${${DISKS_ARRAY}[\$CROSSNODE_DISK_INDEX]}"
+            if [[ " ${IO_MODE_DISKS} " != *" ${DISK_KEY} "* ]]; then
+                log_info "Skipping v2.${DISK_KEY} under ${IO_MODE} mode (not listed in v2.ioModes.${IO_MODE})."
+                continue
+            fi
 
-        for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
-            log_run "Benchmarking v2 1-replica ${BDEV_TYPE}-bdev volume with CPU mask ${CPU_MASK}..."
-            benchmark_v2_r1_volume "${CPU_MASK}" "$BDEV_TYPE" "$VOLUME_ATTACH_DISK" || exit 1
-        done
+            local disks_count
+            eval "disks_count=\${#${DISKS_ARRAY}[@]}"
+            if [[ "$disks_count" -eq 0 ]]; then
+                log_info "Skipping ${BDEV_TYPE} bdev (${DISKS_ARRAY} is empty)."
+                continue
+            fi
+            # VOLUME_ATTACH_DISK is the disk on the node where the engine
+            # attaches (VOLUME_ATTACH_NODE) - used for the co-located 1-replica
+            # benchmark. CROSSNODE_DISK is on the node immediately after it, so
+            # the replica genuinely lands on a different node than the engine.
+            local VOLUME_ATTACH_DISK CROSSNODE_DISK
+            eval "VOLUME_ATTACH_DISK=\${${DISKS_ARRAY}[\$VOLUME_ATTACH_NODE_INDEX]}"
+            eval "CROSSNODE_DISK=\${${DISKS_ARRAY}[\$CROSSNODE_DISK_INDEX]}"
 
-        for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
-            log_run "Benchmarking v2 1-replica cross-node ${BDEV_TYPE}-bdev volume with CPU mask ${CPU_MASK}..."
-            benchmark_v2_r1_crossnode_volume "${CPU_MASK}" "$BDEV_TYPE" "$CROSSNODE_DISK" || exit 1
-        done
+            for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
+                log_run "Benchmarking v2 1-replica ${BDEV_TYPE}-bdev ${IO_MODE}-mode volume with CPU mask ${CPU_MASK}..."
+                benchmark_v2_r1_volume "${CPU_MASK}" "$BDEV_TYPE" "$VOLUME_ATTACH_DISK" "$IO_MODE" || exit 1
+            done
 
-        for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
-            log_run "Benchmarking v2 3-replicas ${BDEV_TYPE}-bdev volume with CPU mask ${CPU_MASK}..."
-            benchmark_v2_r3_volume "${CPU_MASK}" "$BDEV_TYPE" "$DISKS_ARRAY" || exit 1
+            for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
+                log_run "Benchmarking v2 1-replica cross-node ${BDEV_TYPE}-bdev ${IO_MODE}-mode volume with CPU mask ${CPU_MASK}..."
+                benchmark_v2_r1_crossnode_volume "${CPU_MASK}" "$BDEV_TYPE" "$CROSSNODE_DISK" "$IO_MODE" || exit 1
+            done
+
+            for CPU_MASK in "${V2_CPU_MASKS[@]}"; do
+                log_run "Benchmarking v2 3-replicas ${BDEV_TYPE}-bdev ${IO_MODE}-mode volume with CPU mask ${CPU_MASK}..."
+                benchmark_v2_r3_volume "${CPU_MASK}" "$BDEV_TYPE" "$DISKS_ARRAY" "$IO_MODE" || exit 1
+            done
         done
     done
 }
@@ -250,6 +263,8 @@ function benchmark_v2_shard_volume() {
 
     disable_data_engine "v2" || exit 1
     update_data_engine_cpu_mask "$CPU_MASK" || exit 1
+    # Shard labels don't carry an I/O mode, so pin Poll to avoid leaking Interrupt from v2 runs.
+    update_data_engine_io_mode "Poll" || exit 1
     enable_data_engine "v2" || exit 1
 
     # EC spreads chunks across k+m distinct nodes, so every node needs its
