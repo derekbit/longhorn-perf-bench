@@ -463,17 +463,20 @@ def build_html_table(group, labels, modes, raw):
             cells.append(f"<td>{fmt_number(scaled_value(raw, label, m, write_field, scale))}</td>")
         rows.append(f'<tr><th class="row-label">{html.escape(label)}</th>{"".join(cells)}</tr>')
 
+    # A <caption> can be split from its table by WeasyPrint, so wrap both in an unbreakable block.
     return f"""
-    <table class="results-table">
-      <caption>{html.escape(caption)}</caption>
-      <thead>
-        <tr><th></th>{header_top}</tr>
-        <tr><th></th>{header_sub}</tr>
-      </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
-    </table>
+    <div class="table-block">
+      <div class="table-caption">{html.escape(caption)}</div>
+      <table class="results-table">
+        <thead>
+          <tr><th></th>{header_top}</tr>
+          <tr><th></th>{header_sub}</tr>
+        </thead>
+        <tbody>
+          {''.join(rows)}
+        </tbody>
+      </table>
+    </div>
     """
 
 
@@ -535,9 +538,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   h2:first-of-type {{ page-break-before: auto; break-before: auto; }}
   h3 {{ border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-top: 28px;
         page-break-after: avoid; break-after: avoid; }}
-  table.results-table {{ border-collapse: collapse; margin: 16px 0 32px; width: 100%; font-size: 13px;
+  .table-block {{ margin: 16px 0 32px; page-break-inside: avoid; break-inside: avoid; }}
+  .table-block + .table-block, h3.charts-heading {{ page-break-before: always; break-before: page; }}
+  .table-caption {{ text-align: left; font-weight: bold; font-size: 14px; margin-bottom: 6px;
+                    page-break-after: avoid; break-after: avoid; }}
+  table.results-table {{ border-collapse: collapse; margin: 0; width: 100%; font-size: 13px;
                          table-layout: auto; page-break-inside: avoid; break-inside: avoid; }}
-  table.results-table caption {{ text-align: left; font-weight: bold; font-size: 14px; margin-bottom: 6px; }}
   table.results-table th, table.results-table td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: right;
                                                     white-space: nowrap; }}
   table.results-table th.row-label, table.results-table td.row-label {{ text-align: left; background: #f2e9f7;
@@ -565,7 +571,7 @@ SECTION_TEMPLATE = """  <h2>{heading}</h2>
   <h3>Summary Tables</h3>
   {tables}
 
-  <h3>Charts</h3>
+  <h3 class="charts-heading">Charts</h3>
   <div class="charts-grid">
     {charts}
   </div>
