@@ -342,8 +342,8 @@ function run_fio() {
         "$RAND_READ_LAT_NS" "$RAND_WRITE_LAT_NS"
 }
 
-# generate_report - regenerate results/report.html, results/report.pdf and
-# results/results.md from results.csv.
+# generate_report - regenerate report.html, report.pdf, results.md and charts/
+# under ${RESULTS_DIR} from results.csv.
 function generate_report() {
     if [[ ! -f "$RESULTS_CSV" ]]; then
         log_warn "No results recorded yet, skipping report generation."
@@ -364,6 +364,7 @@ function generate_report() {
         --out "$REPORT_HTML"
         --md  "$RESULTS_MD"
         --pdf "$REPORT_PDF"
+        --svg-dir "${RESULTS_DIR}/charts"
     )
     if [[ -n "$longhorn_version" ]]; then
         args+=(--longhorn-version "$longhorn_version")

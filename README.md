@@ -26,7 +26,50 @@ To use a different config file, pass `-c` / `--config` (or set
 CONFIG_FILE=/path/to/my.json ./run.sh run  # env var
 ```
 
-Precedence: `--config` flag > `CONFIG_FILE` env > `${SCRIPT_DIR}/config.json`.
+Precedence: `--config` flag > `CONFIG_FILE` env > `./config.json` (current
+directory) > `${SCRIPT_DIR}/config.json`.
+
+Results (`results.csv`, `report.html`, `report.pdf`, `results.md`, `charts/`,
+`logs/`) are written to `-o` / `--output <dir>`, default `./results`.
+
+```sh
+./run.sh --config my.json --output out run
+```
+
+## Docker
+
+Build the image (`REPO` defaults to `derekbit`, `TAG` to `latest`; the image
+is named `$REPO/longhorn-perf-bench:$TAG`):
+
+```sh
+make                          # derekbit/longhorn-perf-bench:latest
+REPO=myrepo TAG=v1.13 make    # myrepo/longhorn-perf-bench:v1.13
+```
+
+Run it from the directory holding `config.json`. With no command it runs the
+benchmark (`run`); `--config` defaults to `config.json` and `--output` to
+`results`, both relative to the mounted `/work`. The container needs a
+kubeconfig to reach the cluster:
+
+```sh
+docker run --rm \
+  -v ~/.kube/config:/root/.kube/config:ro \
+  -v "$PWD":/work \
+  derekbit/longhorn-perf-bench --config config.json --output results
+```
+
+Other commands work the same way, e.g. `... derekbit/longhorn-perf-bench cleanup`
+or `... derekbit/longhorn-perf-bench report`.
+
+A container cannot read host files unless they are mounted, so the two `-v`
+flags are required. To avoid typing them, add an alias (e.g. in `~/.zshrc`):
+
+```sh
+alias longhorn-perf-bench='docker run --rm -v "$PWD":/work -v ~/.kube/config:/root/.kube/config:ro derekbit/longhorn-perf-bench'
+
+longhorn-perf-bench --config config.json --output results
+longhorn-perf-bench cleanup
+```
 
 ## Configuration (`config.json`)
 

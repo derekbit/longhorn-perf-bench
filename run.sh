@@ -5,19 +5,22 @@ set -o pipefail
 # Longhorn performance benchmark driver.
 #
 # Usage:
-#   ./run.sh [-c|--config <path>] reset             Reset the cluster to its default state.
-#   ./run.sh [-c|--config <path>] cleanup           Delete the fio test Job/pods and PVC.
-#   ./run.sh [-c|--config <path>] run                Benchmark whichever engines are listed in
+#   ./run.sh [-c|--config <path>] [-o|--output <dir>] reset     Reset the cluster to its default state.
+#   ./run.sh [-c|--config <path>] [-o|--output <dir>] cleanup   Delete the fio test Job/pods and PVC.
+#   ./run.sh [-c|--config <path>] [-o|--output <dir>] run       Benchmark whichever engines are listed in
 #                                                    config.json's `dataEngines` (any subset of
 #                                                    {v1, v2, shard}).
-#   ./run.sh [-c|--config <path>] report             Regenerate results/report.html only.
+#   ./run.sh [-c|--config <path>] [-o|--output <dir>] report    Regenerate the report files only.
 #
 # The config path can also be set via the CONFIG_FILE env var
 # (`CONFIG_FILE=... ./run.sh run`). Precedence: CLI flag > env var >
-# ${SCRIPT_DIR}/config.json.
+# ./config.json (current directory) > ${SCRIPT_DIR}/config.json.
 #
-# Each `run` regenerates results/report.html (tables + bar charts) from
-# results/results.csv - no manual steps are required to view the results.
+# Results (results.csv, report.html/pdf, results.md, charts/, logs/) go to
+# --output, default ./results (relative to the current directory).
+#
+# Each `run` regenerates the report from results.csv - no manual steps are
+# required to view the results.
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # bottom.
 # ---------------------------------------------------------------------------
 _CLI_CONFIG_FILE=""
+_CLI_OUTPUT_DIR=""
 POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,13 +50,27 @@ while [[ $# -gt 0 ]]; do
             _CLI_CONFIG_FILE="${1#--config=}"
             shift
             ;;
+        -o|--output)
+            if [[ -z "$2" ]]; then
+                echo "❌ ${1} requires a directory argument." >&2
+                exit 1
+            fi
+            _CLI_OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --output=*)
+            _CLI_OUTPUT_DIR="${1#--output=}"
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [-c|--config <path>] {setup|reset|cleanup|run|report}"
+            echo "Usage: $0 [-c|--config <path>] [-o|--output <dir>] {setup|reset|cleanup|run|report}"
             echo "  setup    Create .venv and install report deps (matplotlib/weasyprint)."
             echo "  cleanup  Delete the fio test Job/pods and PVC."
             echo "  run      Benchmark engines listed in <config>.dataEngines"
             echo "           (any subset of {v1, v2, shard})."
-            echo "  Config precedence: --config flag > CONFIG_FILE env > ${SCRIPT_DIR}/config.json"
+            echo "  -c, --config  Config file. Default: ./config.json, else ${SCRIPT_DIR}/config.json"
+            echo "                (precedence: flag > CONFIG_FILE env > default)."
+            echo "  -o, --output  Results directory. Default: ./results"
             exit 0
             ;;
         --)
@@ -71,9 +89,25 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-# CONFIG_FILE precedence: --config flag > env > default.
-CONFIG_FILE="${_CLI_CONFIG_FILE:-${CONFIG_FILE:-${SCRIPT_DIR}/config.json}}"
+# CONFIG_FILE precedence: --config flag > env > ./config.json > bundled default.
+CONFIG_FILE="${_CLI_CONFIG_FILE:-${CONFIG_FILE:-}}"
+if [[ -z "$CONFIG_FILE" ]]; then
+    if [[ -f "${PWD}/config.json" ]]; then
+        CONFIG_FILE="${PWD}/config.json"
+    else
+        CONFIG_FILE="${SCRIPT_DIR}/config.json"
+    fi
+fi
 unset _CLI_CONFIG_FILE
+
+# Results directory: --output flag > ./results. Made absolute so later cd's can't move it.
+RESULTS_DIR="${_CLI_OUTPUT_DIR:-results}"
+case "$RESULTS_DIR" in
+    /*) ;;
+    *)  RESULTS_DIR="${PWD}/${RESULTS_DIR}" ;;
+esac
+RESULTS_DIR="${RESULTS_DIR%/}"
+unset _CLI_OUTPUT_DIR
 
 # shellcheck source=lib/log.sh
 source "${SCRIPT_DIR}/lib/log.sh"
@@ -130,6 +164,10 @@ fi
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "❌ Config file not found: ${CONFIG_FILE}" >&2
     echo "   Pass '-c <path>' / '--config <path>' or set CONFIG_FILE=... to override." >&2
+    if [[ -f /.dockerenv || -f /run/.containerenv ]]; then
+        echo "   The container cannot see host files; mount your config directory (and kubeconfig) at run time:" >&2
+        echo "     docker run --rm -v \"\$PWD\":/work -v ~/.kube/config:/root/.kube/config:ro <image> --config ${CONFIG_FILE##*/}" >&2
+    fi
     exit 1
 fi
 
@@ -351,7 +389,7 @@ FIO_YAML="${TMP_DIR}/fio.yaml"
 FIO_JOB_NAME="kbench"
 FIO_PVC_NAME="kbench-pvc"
 
-RESULTS_DIR="${SCRIPT_DIR}/results"
+# RESULTS_DIR is resolved right after CLI parsing (--output, default ./results).
 RESULTS_CSV="${RESULTS_DIR}/results.csv"
 RESULTS_MD="${RESULTS_DIR}/results.md"
 RESULTS_LOG_DIR="${RESULTS_DIR}/logs"
@@ -430,7 +468,7 @@ main() {
             generate_report
             ;;
         *)
-            echo "Usage: $0 [-c|--config <path>] {setup|reset|cleanup|run|report}" >&2
+            echo "Usage: $0 [-c|--config <path>] [-o|--output <dir>] {setup|reset|cleanup|run|report}" >&2
             echo "  setup    Create .venv and install report deps (matplotlib/weasyprint)." >&2
             echo "  cleanup  Delete the fio test Job/pods and PVC." >&2
             echo "  run      Benchmark engines listed in ${CONFIG_FILE}'s 'dataEngines'." >&2
