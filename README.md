@@ -100,9 +100,9 @@ v2 volumes are benchmarked against **both** SPDK bdev backends, driven by
 `v2.nvmeBdevDisks` and `v2.aioBdevDisks` in [`config.json`](config.json):
 
 - `v2.nvmeBdevDisks` - PCI BDF paths (e.g. `0000:00:0b.0`) - runs first,
-  as NVMe bdev. Labeled `v2 volume (NVMe-OF frontend, NVMe bdev, ...)`.
+  as NVMe bdev. Labeled `v2 volume (NVMe-oF frontend, NVMe bdev, ...)`.
 - `v2.aioBdevDisks` - block device paths (e.g. `/dev/nvme3n1`) - runs
-  next, as AIO bdev. Labeled `v2 volume (NVMe-OF frontend, AIO bdev, ...)`.
+  next, as AIO bdev. Labeled `v2 volume (NVMe-oF frontend, AIO bdev, ...)`.
 
 Set either array to `[]` to skip that backend. Each backend runs the full
 `v2.ioModes x v2.cpuMasks x {1 replica, 1 cross-node replica, 3 replicas}`

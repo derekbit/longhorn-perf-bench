@@ -32,13 +32,13 @@ function cpu_mask_to_cores() {
 }
 
 # v2_label <bdev_type> <cpu_mask> <io_mode> - produces a canonical v2 volume
-# label such as: "v2 volume (NVMe-OF frontend, NVMe bdev, Poll, Hugepage, 4 CPU cores)".
+# label such as: "v2 volume (NVMe-oF frontend, NVMe bdev, Poll, Hugepage, 4 CPU cores)".
 function v2_label() {
     local BDEV_TYPE="$1" CPU_MASK="$2" IO_MODE="$3"
     local CORES SUFFIX
     CORES=$(cpu_mask_to_cores "$CPU_MASK")
     if [[ "$CORES" -eq 1 ]]; then SUFFIX="CPU core"; else SUFFIX="CPU cores"; fi
-    echo "v2 volume (NVMe-OF frontend, ${BDEV_TYPE} bdev, ${IO_MODE}, Hugepage, ${CORES} ${SUFFIX})"
+    echo "v2 volume (NVMe-oF frontend, ${BDEV_TYPE} bdev, ${IO_MODE}, Hugepage, ${CORES} ${SUFFIX})"
 }
 
 function reset_environment() {
