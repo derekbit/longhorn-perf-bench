@@ -350,12 +350,10 @@ function generate_report() {
         return 0
     fi
 
-    # Best-effort: fetch the Longhorn version from the cluster so the report
-    # title reflects what was actually benchmarked. Silently skip if kubectl
-    # isn't available or the setting can't be read (e.g. cluster torn down
-    # after the run).
-    local longhorn_version=""
-    if command -v kubectl >/dev/null 2>&1; then
+    # config.json's longhornVersion wins; otherwise best-effort fetch from the
+    # cluster (silently skipped if kubectl or the setting is unavailable).
+    local longhorn_version="${LONGHORN_VERSION:-}"
+    if [[ -z "$longhorn_version" ]] && command -v kubectl >/dev/null 2>&1; then
         longhorn_version="$(kubectl -n longhorn-system get setting.longhorn.io current-longhorn-version \
             -o jsonpath='{.value}' 2>/dev/null || true)"
     fi

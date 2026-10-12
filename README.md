@@ -49,6 +49,7 @@ engine skips that backend for that engine.
 | `shareManagerPodNodeIndex` | `integer` | Index into `nodes` for each StorageClass's share-manager (RWX only).                                        |
 | `runBaseline`              | `bool`    | If `true`, also install local-path-provisioner and record it as a baseline (RWO-only, skipped under RWX).   |
 | `dataEngines`              | `string[]` | Which engine suites to run this session. Any subset of `["v1", "v2", "shard"]`.                             |
+| `longhornVersion`          | `string`  | Version shown in the report title (e.g. `"v1.13"`). If empty or omitted, `current-longhorn-version` is read from the cluster. |
 
 **`v1`** (filesystem-disk based replica volumes)
 

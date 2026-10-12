@@ -100,6 +100,7 @@ source "${SCRIPT_DIR}/lib/benchmarks.sh"
 #     shareManagerPodNodeIndex   -> SHARE_MANAGER_POD_NODE_INDEX   (integer)
 #     runBaseline                -> RUN_BASELINE                   (bool)
 #     dataEngines                -> DATA_ENGINES                   (subset of {v1, v2, shard})
+#     longhornVersion            -> LONGHORN_VERSION               (report title version, e.g. "v1.13"; default: read from cluster)
 #
 #   v1: { filesystemDisks }      -> FILESYSTEM_DISKS               (string array, per-node)
 #
@@ -208,6 +209,9 @@ RUN_BASELINE=$(_cfg_scalar '.runBaseline')
 # access mode in FIO_ACCESS_MODES; "shard" is independent (RWO-only) and
 # runs once as its own report section.
 read_array DATA_ENGINES       < <(_cfg_array '.dataEngines')
+
+# Version shown in the report title. Empty -> current-longhorn-version from the cluster.
+LONGHORN_VERSION=$(_cfg_scalar '.longhornVersion // ""')
 
 # -- v1 (filesystem-disk based replica volumes) -----------------------------
 # Per-node filesystem-disk paths for the v1 data engine. Each entry is

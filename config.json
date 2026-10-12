@@ -10,6 +10,8 @@
 
   "dataEngines": ["v1", "v2"],
 
+  "longhornVersion": "v1.13",
+
   "v1": {
     "filesystemDisks": ["/mnt/disk", "/mnt/disk", "/mnt/disk"]
   },
